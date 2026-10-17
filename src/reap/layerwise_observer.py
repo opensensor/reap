@@ -169,6 +169,13 @@ class LayerwiseMoEObserver:
         """
         self.model = model
         self.hook_config = hook_config
+        if hook_config.pruning_adapter == "muse_spark":
+            raise NotImplementedError(
+                "Muse Spark needs layer-specific sliding/full attention masks and RoPE/NoPE "
+                "replay, plus shard streaming for large checkpoints. Use "
+                "MoETransformerObserver on a materialized model or "
+                "collect_muse_pruning_metrics on one materialized MoE for now."
+            )
         self._memory_cleanup_freq = 4
 
         # Auto-detect decoder blocks if not provided

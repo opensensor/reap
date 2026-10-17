@@ -16,7 +16,6 @@ from accelerate.utils import set_seed
 from accelerate.hooks import remove_hook_from_module
 
 
-from reap.main import record_activations, smoke_test, create_results_directory, dump_args_to_yaml
 from reap.args import (
     ReapArgs,
     ModelArgs,
@@ -26,14 +25,10 @@ from reap.args import (
     DatasetArgs,
     ClusterArgs,
 )
-from reap.data import DATASET_REGISTRY
-from reap.cluster import (
-    get_penalty_vector,
-    hierarchical_clustering,
-    dynamic_frequency_penalized_clustering,
+from reap.model_util import (
+    get_moe, get_model_layers, get_model_text_config, MODEL_ATTRS,
+    patched_model_map, get_super_expert_indices,
 )
-from reap.model_util import get_moe, assert_merge, MODEL_ATTRS, patched_model_map, get_super_expert_indices
-from reap.eval import run_evaluate
 import shutil
 
 logger = logging.getLogger(__name__)
@@ -51,6 +46,34 @@ def prune(
     Prune the model based on the observer data and clustering.
     """
     model_attrs = MODEL_ATTRS[model.__class__.__name__]
+    if model_attrs.get("pruning_adapter") == "muse_spark":
+        from reap.models.muse_spark import validate_muse_moe
+
+        layers = get_model_layers(model)
+        if not len(layers) or set(observer_data) != set(range(len(layers))):
+            raise ValueError("Muse uniform pruning requires observations for every text layer")
+        if not isinstance(n_experts_to_prune, int) or n_experts_to_prune < 0:
+            raise ValueError("n_experts_to_prune must be a non-negative integer")
+        metric = (
+            "expert_frequency" if prune_args.prune_method == "frequency"
+            else prune_args.prune_method
+        )
+        for layer in observer_data:
+            moe = get_moe(model, layer)
+            validate_muse_moe(moe)
+            if moe.experts.num_experts != get_model_text_config(model).num_local_experts:
+                raise ValueError("Muse export currently requires uniform expert counts")
+            if observer_data[layer]["expert_frequency"].numel() != moe.experts.num_experts:
+                raise ValueError("Muse observations and expert counts disagree")
+            if moe.experts.num_experts - n_experts_to_prune < moe.gate.top_k:
+                raise ValueError("Muse pruning must retain at least top_k experts")
+            saliency = observer_data[layer].get(metric)
+            if (not isinstance(saliency, torch.Tensor)
+                    or saliency.shape != (moe.experts.num_experts,)
+                    or not torch.isfinite(saliency).all()):
+                raise ValueError("Muse requires finite per-expert pruning saliency for every layer")
+            if observer_data[layer]["total_tokens"] <= 0:
+                raise ValueError("Muse requires nonempty calibration observations")
 
     for layer in observer_data:
         if "expert_proba" not in observer_data[layer]:
@@ -98,16 +121,26 @@ def prune(
                     f"Prune method {prune_args.prune_method} not found in observer data for layer {layer}. "
                     f"Available keys: {list(observer_data[layer].keys())}"
                 )
-            _, experts_to_prune = torch.topk(
-                saliency_data, n_experts_to_prune, largest=False
-            )
+            if model_attrs.get("pruning_adapter") == "muse_spark":
+                # Stable ties retain lower original IDs, independent of topk kernels.
+                experts_to_prune = torch.argsort(saliency_data, descending=True, stable=True)[
+                    num_experts - n_experts_to_prune:
+                ]
+            else:
+                _, experts_to_prune = torch.topk(
+                    saliency_data, n_experts_to_prune, largest=False
+                )
 
         retained_expert_indicies = [
             i for i in range(num_experts) if i not in experts_to_prune
         ]
         # prune experts
         moe = get_moe(model, layer)
-        if not model_attrs["fused"]:
+        if model_attrs.get("pruning_adapter") == "muse_spark":
+            from reap.models.muse_spark import prune_muse_experts
+
+            prune_muse_experts(moe, retained_expert_indicies)
+        elif not model_attrs["fused"]:
             all_experts = getattr(moe, model_attrs["experts"])
             retained_experts = [all_experts[i] for i in retained_expert_indicies]
             retained_experts = torch.nn.ModuleList(retained_experts)
@@ -147,7 +180,7 @@ def prune(
     # patch config and dump
     logger.info("Saving pruned model...")
     retained_experts = len(retained_expert_indicies)
-    setattr(model.config, model_attrs["num_experts"], retained_experts)
+    setattr(get_model_text_config(model), model_attrs["num_experts"], retained_experts)
     if model.__class__.__name__ == "Ernie4_5_MoeForCausalLM":  # remote-code verson
         model.config.moe_capacity = [
             retained_experts,
@@ -195,6 +228,9 @@ def get_pruned_model_dir(
 
 
 def main():
+    from reap.main import record_activations, smoke_test, create_results_directory, dump_args_to_yaml
+    from reap.eval import run_evaluate
+
     parser = HfArgumentParser(
         (
             ReapArgs,
