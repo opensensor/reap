@@ -3,7 +3,7 @@ import json
 
 import pytest
 
-from reap.muse_corpus import select_records, split_for_group
+from reap.muse_corpus import magicoder_candidates, select_records, split_for_group
 
 
 class TinyTokenizer:
@@ -64,3 +64,27 @@ def test_whole_records_never_silently_truncated():
             {"calibration": 1, "validation": 1},
             set(),
         )
+
+
+def test_magicoder_ids_include_language_and_source_index(tmp_path):
+    source = tmp_path / "data.jsonl"
+    source.write_text(
+        "\n".join(
+            json.dumps(
+                {
+                    "lang": language,
+                    "raw_index": 10,
+                    "index": 1,
+                    "seed": language,
+                    "problem": "task",
+                    "solution": "solution",
+                }
+            )
+            for language in ("python", "cpp")
+        )
+    )
+    records = [
+        next(magicoder_candidates(source, language)) for language in ("python", "cpp")
+    ]
+    assert records[0]["id"] != records[1]["id"]
+    assert records[0]["source"]["raw_index"] == 10

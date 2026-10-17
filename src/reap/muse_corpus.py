@@ -97,13 +97,15 @@ def magicoder_candidates(path, language):
         if row["lang"] != language:
             continue
         yield {
-            "id": f"magicoder:{row['index']}",
+            "id": f"magicoder:{language}:{row['raw_index']}:{row['index']}",
             "group": "magicoder-seed:" + digest(normalized(row["seed"])),
             "category": f"coding_{language}",
             "source": {
                 "dataset": "ise-uiuc/Magicoder-OSS-Instruct-75K",
                 "revision": MAGICODER_REVISION,
                 "index": row["index"],
+                "raw_index": row["raw_index"],
+                "language": language,
                 "license": "mit",
             },
             "prompt": row["problem"],
@@ -231,6 +233,9 @@ def main():
     val_groups = {r["group"] for r in corpus["validation"]}
     if cal_groups & val_groups:
         raise ValueError("calibration/validation source groups overlap")
+    ids = [r["id"] for split in ("calibration", "validation") for r in corpus[split]]
+    if len(ids) != len(set(ids)):
+        raise ValueError("corpus record IDs must be globally unique")
     corpus["inputs"] = {}
     for name, path in (
         ("magicoder", args.magicoder),

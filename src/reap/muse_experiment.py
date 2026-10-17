@@ -65,6 +65,9 @@ def run_experiment(
     validation, val_records = load_corpus_batches(corpus_path, "validation")
     if not calibration or not validation:
         raise ValueError("both corpus splits must be nonempty")
+    ids = [r["id"] for r in cal_records + val_records]
+    if len(ids) != len(set(ids)):
+        raise ValueError("duplicate corpus IDs overlap")
     for key in ("id", "group", "token_sha256"):
         if {r[key] for r in cal_records} & {r[key] for r in val_records}:
             raise ValueError(f"calibration/validation {key} overlap")

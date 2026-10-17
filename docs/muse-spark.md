@@ -252,8 +252,8 @@ text/prompt duplicates and exact token duplicates. This is not semantic
 deduplication or proof of independence from Muse pretraining. Published coding
 benchmark test sets are not used in this calibration recipe.
 
-The initial local corpus contains 96 calibration records (39,836 tokens) and 24
-validation records (9,694 tokens), at most 512 tokens each. That is a screening
+The initial local corpus contains 96 calibration records (39,588 tokens) and 24
+validation records (9,825 tokens), at most 512 tokens each. That is a screening
 pilot, not a final calibration budget. Inspect per-layer coverage in `plans/*.json`,
 especially never-observed or sparsely observed retained experts, before trusting
 the rankings. The script rejects incomplete calibration and corrupt scores.
