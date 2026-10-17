@@ -171,10 +171,10 @@ class LayerwiseMoEObserver:
         self.hook_config = hook_config
         if hook_config.pruning_adapter == "muse_spark":
             raise NotImplementedError(
-                "Muse Spark needs layer-specific sliding/full attention masks and RoPE/NoPE "
-                "replay, plus shard streaming for large checkpoints. Use "
-                "MoETransformerObserver on a materialized model or "
-                "collect_muse_pruning_metrics on one materialized MoE for now."
+                "Legacy replay does not implement Muse's layer-specific sliding/full "
+                "attention and RoPE/NoPE handling. Use reap.muse_streaming for indexed "
+                "checkpoints, MoETransformerObserver on a materialized model, or "
+                "collect_muse_pruning_metrics on one materialized MoE."
             )
         self._memory_cleanup_freq = 4
 
