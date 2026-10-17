@@ -188,12 +188,102 @@ exactly, including left/right padding, explicit positions, alternating full/slid
 attention, RoPE/NoPE, and sequences past the sliding window. They also cover module
 release, interruption/restart, changed-input/artifact rejection, and writer locking.
 
+## Whole-model coding screen
+
+`reap.muse_experiment` runs a CPU-only, resumable screening experiment. It first
+calibrates every layer on the calibration split, freezes independent per-layer
+expert selections, and then replays the validation split through the baseline and
+each candidate. Defaults compare 128 and 144 retained experts using `reap` and
+`weighted_ean_sum` (the sum of router-weighted output norms). Top-k is unchanged.
+Candidates physically slice the in-memory layer; no checkpoint is exported.
+
+The output head is loaded only after the decoder and final norm have finished.
+Logits are computed in chunks of 32 valid token positions, using the native output
+multiplier and tanh softcap in the checkpoint dtype, then FP32 log-softmax. Reports
+include token-weighted next-token NLL/perplexity, change in NLL, baseline-to-candidate
+KL divergence, top-1 agreement, and logit RMSE. Padding and transitions across
+padding are excluded. Loss includes all valid text tokens, including task prompts;
+it is **not** assistant-only loss, generation accuracy, or executable coding success.
+
+The pilot corpus builder combines complete short Magicoder task/solution records
+in Python, C++, TypeScript, and Rust; complete Glaive tool-use conversations;
+repository test snippets; and complete short test diffs. It uses plain text with
+BOS rather than a Muse chat template. Long instruction records are excluded;
+only repository test files are chunked. This biases the pilot toward short tasks
+and cannot establish long-context or agentic coding quality.
+
+Download the pinned public inputs once; subsequent preparation and evaluation are
+offline. Keep datasets and experiment outputs outside the repository:
+
+```sh
+hf download ise-uiuc/Magicoder-OSS-Instruct-75K --type dataset \
+  --revision 5f839b1f368a76b161028bb9edff055db34022b2 \
+  --include README.md --include data-oss_instruct-decontaminated.jsonl \
+  --local-dir /data/magicoder
+hf download glaiveai/glaive-function-calling-v2 --type dataset \
+  --revision e7f4b6456019f5d8bcb991ef0dd67d8ff23221ac \
+  --include README.md --include glaive-function-calling-v2.json \
+  --local-dir /data/glaive
+
+PYTHONPATH=src python -m reap.muse_corpus \
+  --magicoder /data/magicoder/data-oss_instruct-decontaminated.jsonl \
+  --glaive /data/glaive/glaive-function-calling-v2.json \
+  --repo /path/to/vllm-ascend --revision FULL_GIT_COMMIT \
+  --model /path/to/Muse-Spark-Open-816B-A42B \
+  --output /data/coding-v2.json --max-tokens 512
+
+HF_HUB_OFFLINE=1 CUDA_VISIBLE_DEVICES='' PYTHONPATH=src python -m reap.muse_experiment \
+  --source /path/to/Muse-Spark-Open-816B-A42B --corpus /data/coding-v2.json \
+  --output /data/coding-screen-v2 --threads 8
+```
+
+Use the separate Muse environment described above. Repeat the last command with
+`--resume` after an interruption. `--stop-after-calibration-layer N` can validate
+an initial portion of calibration before resuming the full experiment. Inputs,
+thread count, code, plans, source metadata, and activation checksums are verified.
+Freeze a checkout for long experiments: editing the runner changes its identity
+and deliberately prevents resuming with different code. Earlier streaming runs
+must resume with the runner version that created them.
+
+The builder saves exact token IDs, source revisions/file hashes, category labels,
+and record IDs. Its deterministic split groups Magicoder by seed, Glaive by first
+user request, and repository records by file. It excludes exact normalized
+text/prompt duplicates and exact token duplicates. This is not semantic
+deduplication or proof of independence from Muse pretraining. Published coding
+benchmark test sets are not used in this calibration recipe.
+
+The initial local corpus contains 96 calibration records (39,836 tokens) and 24
+validation records (9,694 tokens), at most 512 tokens each. That is a screening
+pilot, not a final calibration budget. Inspect per-layer coverage in `plans/*.json`,
+especially never-observed or sparsely observed retained experts, before trusting
+the rankings. The script rejects incomplete calibration and corrupt scores.
+
+`experiment.json` records the active phase and completed evaluation results.
+Each phase has the same layer-boundary progress manifest as the streaming runner.
+Batch progress messages are informational; only committed layers are resumable.
+The phases are `calibration`, `baseline`, and one directory per ranking/count.
+Each validation phase writes `evaluation.json`, including per-record/category
+metrics. Completion does not automatically select a winner or export weights.
+
+All candidates reread the source layer shards, and pruning temporarily holds both
+source and selected banks. This uses more peak RAM than baseline replay, but does
+not materialize the full model. Cold storage and CPU compute can make the full
+experiment take hours. Native integration tests compare streamed logits and
+pruned forwards against a complete `MuseSparkForConditionalGeneration` in FP32
+and mixed BF16/FP32, and verify loss/KL across chunk sizes and resumed candidates:
+
+```sh
+HF_HUB_OFFLINE=1 CUDA_VISIBLE_DEVICES='' PYTHONPATH=src python -m pytest -q \
+  tests/test_muse_streaming.py tests/test_muse_spark.py tests/test_pruning_metrics.py \
+  tests/test_muse_evaluate.py tests/test_muse_corpus.py tests/test_muse_experiment.py
+```
+
 ## Remaining milestones
 
-1. Calibrate all 62 layers on representative coding data; compare REAP and
-   contribution weighting using held-out loss/logit drift and executable coding
-   tasks. Near-constant post-normalization expert norms mean REAP may closely
-   track conditional average routing weight on Muse.
+1. Complete the 62-layer coding screen and review held-out loss/logit drift and
+   expert coverage. Extend to longer contexts and executable coding tasks before
+   choosing a final pruning recipe. Near-constant post-normalization expert norms
+   mean REAP may closely track conditional average routing weight on Muse.
 2. Stream a separate pruned checkpoint with tensor slicing, index/config updates,
    retained-ID provenance, interrupted-run handling, and native reload parity.
 3. Evaluate W4 quantization and the Ascend backend independently. Pruning quality,

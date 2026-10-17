@@ -224,6 +224,17 @@ class MuseShardSource:
             self.prefix + "norm.",
         )
 
+    def lm_head(self):
+        """Materialize the untied text output head, preserving checkpoint dtype."""
+        if self.config.tie_word_embeddings:
+            raise ValueError("streamed logits currently require an untied lm_head")
+        return self._module(
+            lambda: torch.nn.Linear(
+                self.config.hidden_size, self.config.vocab_size, bias=False
+            ),
+            "lm_head.",
+        )
+
     def replay_kwargs(self, hidden, batch, layer_index):
         """Use native mask/RoPE builders with this layer's attention semantics."""
         positions = batch["position_ids"]
@@ -385,7 +396,15 @@ def _remove_interrupted_temporaries(output):
 
 @torch.inference_mode()
 def run_calibration(
-    source, batches, output, *, stop_after_layer=None, resume=False, progress=None
+    source,
+    batches,
+    output,
+    *,
+    stop_after_layer=None,
+    resume=False,
+    progress=None,
+    collect_metrics=True,
+    batch_progress=None,
 ):
     """Observe baseline text layers, atomically committing at layer boundaries.
 
@@ -408,6 +427,7 @@ def run_calibration(
         "source": source.identity,
         "batches_sha256": _batches_digest(batches),
         "schema": 1,
+        "collect_metrics": collect_metrics,
     }
     output.mkdir(parents=True, exist_ok=True)
     with (output / ".lock").open("a") as lock:
@@ -504,7 +524,7 @@ def run_calibration(
             old_stage = state["stage"]
             metrics = None
             with source.layer(index) as layer:
-                if source.config.mlp_layer_types[index] == "sparse":
+                if collect_metrics and source.config.mlp_layer_types[index] == "sparse":
                     metrics = initialize_pruning_state(layer.mlp.experts.num_experts)
                 for batch_index, batch in enumerate(batches):
                     hidden = load_file(
@@ -531,6 +551,15 @@ def run_calibration(
                         if handle is not None:
                             handle.remove()
                     del hidden, result
+                    if batch_progress is not None:
+                        batch_progress(
+                            {
+                                "layer": index,
+                                "batches_completed": batch_index + 1,
+                                "batches": len(batches),
+                                "elapsed_seconds": time.monotonic() - start,
+                            }
+                        )
                 resident = _rss_bytes()
             report = (
                 {}
@@ -543,7 +572,12 @@ def run_calibration(
             # Dense layers have no pruning scores; an explicit scalar marks them.
             _save_tensors(
                 output / "scores" / f"layer-{index:05d}.safetensors",
-                report or {"dense_layer": torch.tensor(True)},
+                report
+                or {
+                    "dense_layer"
+                    if collect_metrics
+                    else "metrics_disabled": torch.tensor(True)
+                },
             )
             state["layers"].append(
                 {

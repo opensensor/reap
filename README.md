@@ -1,9 +1,11 @@
 # Router-weighted Expert Activation Pruning (REAP)
 
-This fork includes experimental [Muse Spark pruning and streamed calibration](docs/muse-spark.md).
+This fork includes experimental [Muse Spark pruning and streamed evaluation](docs/muse-spark.md).
 It supports CPU calibration one text layer at a time, resumable activation/score
-artifacts, and pruning materialized eager MoEs. Pruned shard export and complete
-Muse serving support remain in development.
+artifacts, and whole-model loss/logit comparisons of pruned eager MoEs. A coding
+corpus builder and resumable experiment runner compare per-layer REAP and
+contribution rankings. Pruned shard export and complete Muse serving support
+remain in development.
 
 ## Updates
 * 2026-03-30: We have added a memory-efficient layer-wise (block-wise) calibration observer for pruning large models on a single GPU (see `experiments/pruning-layerwise-cli.sh` on how to run layer-wise calibration).
