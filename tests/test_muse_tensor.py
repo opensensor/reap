@@ -268,3 +268,21 @@ def test_decode_candidate_reapplication_does_not_nest_graph_wrappers(monkeypatch
     exec(source, second)
     for name, function in second["replacements"]().items():
         assert function._muse_original is first["replacements"]()[name]._muse_original
+
+
+def test_rank_pool_keeps_each_device_on_one_distinct_host_thread():
+    import threading
+
+    pool = make_pool(["cpu"] * 6)
+    try:
+        visits = []
+        for _ in range(4):
+            futures = [
+                pool.submit(lambda rank: (rank, threading.get_ident()), r)
+                for r in range(6)
+            ]
+            visits.append([f.result() for f in futures])
+        assert len({identity for _, identity in visits[0]}) == 6
+        assert all(row == visits[0] for row in visits)
+    finally:
+        pool.shutdown()

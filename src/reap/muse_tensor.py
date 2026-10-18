@@ -174,14 +174,18 @@ class TensorExperts:
         def run(i, phase, value):
             rank = self.ranks[i]
             with torch.inference_mode(), torch.npu.device(rank.device):
+                # Give each device worker independent, aligned host storage.
+                # Avoid sharing pageable DMA registration across contexts;
+                # each permanent worker retains its own host allocation arena.
+                value, routes = value.clone(), host_routes.clone()
                 if use_graph:
-                    result = self.graphs[i, phase].run(value, host_routes)
+                    result = self.graphs[i, phase].run(value, routes)
                 else:
                     result = self.operation(
                         rank,
                         phase,
                         value.to(rank.device),
-                        host_routes.to(rank.device),
+                        routes.to(rank.device),
                         ends is not None,
                     )
                 return result.cpu()
@@ -237,10 +241,37 @@ def shard_layer(cpu, devices, owner, pool, *, decode_graphs=True):
     return layer
 
 
+class RankPool:
+    """One permanent host thread/context per NPU, with parallel rank execution."""
+
+    def __init__(self, devices):
+        self.workers = []
+        for rank, device in enumerate(devices):
+            device = getattr(device, "device", device)
+            device = f"npu:{device}" if isinstance(device, int) else str(device)
+
+            def initialize(device=device):
+                if device.startswith("npu:"):
+                    torch.npu.set_device(device)
+
+            self.workers.append(
+                ThreadPoolExecutor(
+                    max_workers=1,
+                    initializer=initialize,
+                    thread_name_prefix=f"muse-rank-{rank}",
+                )
+            )
+
+    def submit(self, function, rank, *args):
+        return self.workers[rank].submit(function, rank, *args)
+
+    def shutdown(self, wait=True):
+        for worker in self.workers:
+            worker.shutdown(wait=wait)
+
+
 def make_pool(devices):
-    return ThreadPoolExecutor(
-        max_workers=len(devices), thread_name_prefix="muse-expert"
-    )
+    return RankPool(devices)
 
 
 def tensor_plan(config, journal, stages, max_context, prefill_chunk, reserve_gib):

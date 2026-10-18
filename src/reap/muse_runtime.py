@@ -621,7 +621,13 @@ class MuseRuntime:
                 h = h.cpu().to(
                     layer.device
                 )  # Explicit portable stage transport; no P2P assumption.
-            h = layer(h, start=self.seen, cache=cache)
+            try:
+                h = layer(h, start=self.seen, cache=cache)
+            except Exception as exc:
+                exc.add_note(
+                    f"Muse layer={layer.index}, owner={layer.device}, start={self.seen}, tokens={len(ids)}"
+                )
+                raise
         h = rms(h, self.c.rms_norm_eps, self.globals[PREFIX + "norm.weight"])
         if not all_logits:
             h = h[:, -1:]

@@ -813,7 +813,8 @@ vectors before the shared normalization and ordered expert sum.
 This keeps all 128 experts, top-8 routing, W4 weights, FP16 activations, and the
 existing split-K rounding. It requires neither activation quantization nor
 cross-device floating-point reductions. Two host gathers connect the parallel
-expert projections. Persistent worker threads execute all NPU shards together;
+expert projections. Dedicated device workers execute all NPU shards together using private host
+staging allocations;
 single-token decode replays captured projection graphs. Grouped prefill retains
 the eager native path and handles up to 512 tokens per chunk.
 
