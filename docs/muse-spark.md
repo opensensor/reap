@@ -545,3 +545,32 @@ establish long-context retrieval or coding quality.
 The grouped path also passed synthetic cached and full forwards across all six
 chips from a worker thread (maximum logit error 0.0006104) and generated the same
 three greedy token IDs as native CPU. All 83 focused Muse tests passed.
+
+The complete `ab28485` runtime loaded all 62 layers with
+`--optimized --bounded-attention --max-context 98304 --prefill-chunk 64`.
+Its first 16-token completion finished in 26.12 seconds, including 5.58 seconds
+of prefill, and allocated the configured full-capacity caches. Repeated coding
+checks preserved all three baseline responses exactly:
+
+| Request | Reference seconds | 96K-configured seconds | Speedup |
+| --- | ---: | ---: | ---: |
+| Add, 7 prompt / 16 output tokens | 115.28 | 25.16 | 4.58x |
+| Reverse, 6 prompt / 8 output tokens | 62.87 | 13.91 | 4.52x |
+| Factorial, 15 prompt / 8 output tokens | 72.88 | 16.96 | 4.30x |
+
+These requests use short prompts with the larger cache capacity configured; they
+are not measurements of 96K prompt processing speed or quality.
+
+The expanded-context chat check finished normally with 162 prompt and 84 output
+tokens in 151.77 seconds. Its final addition function passed four arithmetic
+assertions and matched the earlier final answer, although the reasoning text and
+length differed (previously 72 output tokens). Grouped attention preserves the
+quantized weights but changes floating-point operation shapes, so it does not
+promise bitwise-identical generation for every prompt.
+
+A separate full-model prompt crossed the sliding-cache boundary: 2,127 prompt
+tokens plus 16 generated tokens completed in 317.19 seconds (296.06 prefill,
+21.12 decode). Its returned addition function passed syntax validation and four
+arithmetic assertions. This establishes full-model cache rollover and generation
+beyond 2,048 tokens; the complete 96K window has not been evaluated for retrieval,
+coding quality, or end-to-end prompt latency.
