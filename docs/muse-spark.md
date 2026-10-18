@@ -953,7 +953,7 @@ grouped-prefill table-reuse variant failed exact output checks and was rejected
 before resident loading. The streaming runtime retains the established native
 1024 backend and skips redundant device-context visits for prepared decode graphs.
 
-Runtime `fa9e722` is serving on ports 8001 and 8002 after host recovery on
+Runtime `fa9e722` was qualified on ports 8001 and 8002 after host recovery on
 2026-10-18. All 62 layers loaded from verified packed-cache entries, and all
 421 frozen runtime files passed SHA256 checks. Native SSE passes exact response,
 reasoning, usage and finish-reason comparisons on three coding completions,
@@ -1013,3 +1013,52 @@ context limit and FP16 KV precision are unchanged. Cancelled/failed requests and
 resident model changes discard the prefix. Health reports `prefix_cache`, and
 generation logs report `cached_prompt_tokens`; cold throughput and reused-prefix
 latency must be reported separately.
+
+Runtime `ef5ef31` now serves both ports with prefix reuse enabled. All 358 frozen
+runtime files and 62 packed-cache layers verified. The placement plan includes
+the sliding snapshots and the existing 3 GiB reserve per device; it retains the
+98,304-token capacity, original graph patch and established native W4 backend.
+
+The controlled 2,127-token prompt reused 2,048 tokens on its second request:
+
+| Measurement | Cold | Cached prefix |
+| --- | ---: | ---: |
+| First streamed text | 66.758 s | 3.016 s |
+| Prefill time | 66.753 s | 3.010 s |
+| Total HTTP response | 74.483 s | 10.838 s |
+| Decode rate | 1.942 tok/s | 1.917 tok/s |
+
+Both requests produced the same 16 output tokens, usage and finish reason.
+Changing the suffix while retaining those 2,048 tokens also matched a cold run
+exactly: prefill fell from 66.496 to 3.106 seconds. This is avoided prompt work,
+not an improvement in cold prefill throughput or decode. An identical seven-token
+prompt reused its cached logits and delivered first text in 7.75 ms.
+
+Direct Kilo streaming returned `OK` in both runs. Its 689-token prompt reused
+512 tokens, reducing prefill from 21.080 to 5.041 seconds. CLI wall time was
+43.442 seconds cold and 25.208 seconds warm; output counts differed (38 versus
+34), so this is an integration smoke rather than a controlled total-latency
+comparison. HTTP usage still reports the full prompt token count; cache hits
+are visible in server generation logs.
+
+All 112 focused Muse tests pass. The prefix test additionally compares exact
+CPU logits across aligned extensions, divergent prompts, partial chunks and
+sliding-window rollover. Hardware checks cover exact streaming completion/chat
+responses and changed suffixes, plus cancellation followed by a successful cold
+request. Failed/cancelled requests and resident changes invalidate the cache.
+The cache retains one prefix and serving remains single-request. Full-model
+96K retrieval and quality remain unmeasured. Evidence is under
+`../results/muse-opt-v6`, including `stream-validation-summary.json`,
+`prefix-changed-suffix.json`, `kilo-prefix.json` and `final-health.json`.
+
+Additional decode/prefill candidates were evaluated without replacing the live
+kernel. Asynchronous pinned transfers passed parity but reduced median decode
+from 2.003 to 1.884 tok/s. Mask-based W4 unpack measured 1.993 to 2.020 tok/s;
+that small, unbracketed gain was insufficient to promote. Wider Cube tiles and
+a corrected tile-loop variant passed synthetic operator checks with negligible
+decode benefit. Dense input padding also produced no useful gain. A 1,024-token
+prefill chunk was exact but improved isolated whole-layer time by less than 1%;
+a 2,048-token chunk changed some FP16 outputs. A direct peer-copy probe failed
+with an SDMA error despite reported peer capability; the serving worker remained
+functional. None of these candidates is active. `experiments.json` records the
+results and their scope.

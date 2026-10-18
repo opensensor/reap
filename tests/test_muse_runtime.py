@@ -274,6 +274,15 @@ def test_prefix_reuse_preserves_outputs_after_sliding_rollover(exported):
             layer.prefill_chunk = 4
             layer.attention = MethodType(FastMuseLayer.attention, layer)
         runtime.reset()
+        runtime.logit_trace = []
+        original_forward = runtime.forward
+
+        def traced_forward(*args, **kwargs):
+            result = original_forward(*args, **kwargs)
+            runtime.logit_trace.append(result.clone())
+            return result
+
+        runtime.forward = traced_forward
         return runtime
 
     cached, cold = make(True), make(False)
@@ -287,7 +296,14 @@ def test_prefix_reuse_preserves_outputs_after_sliding_rollover(exported):
         ([1, 4, 7, 8], 0),
     ]
     for prompt, reused in cases:
+        cached.logit_trace.clear()
+        cold.logit_trace.clear()
         assert cached.generate(prompt, 6) == cold.generate(prompt, 6)
+        actual_logits = cached.logit_trace[-6:]
+        if len(actual_logits) == 5:
+            actual_logits = [cached.prefix_snapshot.logits, *actual_logits]
+        for actual, expected in zip(actual_logits, cold.logit_trace[-6:], strict=True):
+            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
         assert cached.generation_stats["cached_prompt_tokens"] == reused
         assert cold.generation_stats["cached_prompt_tokens"] == 0
         # Every request decodes far enough to move the small sliding window.
