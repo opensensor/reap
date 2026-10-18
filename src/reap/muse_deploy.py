@@ -95,6 +95,8 @@ def run(args):
                 "--port",
                 str(args.port),
             ]
+            if getattr(args, "deterministic", False):
+                command.append("--deterministic")
             if args.optimized:
                 command.append("--optimized")
             if args.bounded_attention:
@@ -195,6 +197,7 @@ def main():
     parser.add_argument("--port", type=int, default=8002)
     parser.add_argument("--additional-port", type=int, action="append", default=[])
     parser.add_argument("--optimized", action="store_true")
+    parser.add_argument("--deterministic", action="store_true")
     parser.add_argument("--bounded-attention", action="store_true")
     parser.add_argument("--packed-cache", type=Path)
     parser.add_argument("--resident-token-file", type=Path)

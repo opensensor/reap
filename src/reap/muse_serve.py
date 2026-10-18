@@ -82,6 +82,7 @@ def create_app(
             "optimized": getattr(runtime, "optimized", False),
             "bounded_attention": getattr(runtime, "bounded_attention", False),
             "prefill_chunk": getattr(runtime, "prefill_chunk", None),
+            "deterministic": getattr(runtime, "deterministic", False),
             "resident": resident.status() if resident else None,
         }
 
@@ -239,12 +240,23 @@ def main():
     parser.add_argument("--additional-port", type=int, action="append", default=[])
     parser.add_argument("--served-model-name")
     parser.add_argument("--optimized", action="store_true")
+    parser.add_argument("--deterministic", action="store_true")
     parser.add_argument("--bounded-attention", action="store_true")
     parser.add_argument("--packed-cache", type=Path)
     parser.add_argument("--resident-token-file", type=Path)
     args = parser.parse_args()
     if args.bounded_attention and (not args.optimized or args.max_context < 1):
         parser.error("--bounded-attention requires --optimized and positive context")
+    if args.resident_token_file and not args.optimized:
+        parser.error("resident controls require --optimized")
+    token = None
+    if args.resident_token_file:
+        token = args.resident_token_file.read_text().strip()
+        if args.resident_token_file.stat().st_mode & 0o077 or len(token) < 32:
+            parser.error(
+                "resident token file must be private and contain a 32+ character secret"
+            )
+    torch.use_deterministic_algorithms(args.deterministic)
     torch.set_num_threads(8 if args.optimized else 2)
     if any(d.startswith("npu:") for d in args.devices):
         import torch_npu
@@ -270,15 +282,11 @@ def main():
         packed_cache=args.packed_cache,
     )
     torch.set_num_threads(2)
-    resident = token = None
+    runtime.deterministic = args.deterministic
+    resident = None
     if args.resident_token_file:
         from reap.muse_resident import Resident
 
-        token = args.resident_token_file.read_text().strip()
-        if args.resident_token_file.stat().st_mode & 0o077 or len(token) < 32:
-            parser.error(
-                "resident token file must be private and contain a 32+ character secret"
-            )
         resident = Resident(runtime)
     config = uvicorn.Config(
         create_app(

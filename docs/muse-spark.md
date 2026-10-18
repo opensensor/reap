@@ -739,3 +739,11 @@ TORCH_DEVICE_BACKEND_AUTOLOAD=0 python -m reap.muse_packed \
 The packed cache needs approximately another full checkpoint's disk capacity.
 The first build includes packing, writing and hashing costs; startup acceleration
 must be measured on cache hits. Hot switches do not read model weights from disk.
+
+`--deterministic` enables Torch/CANN deterministic algorithms. In the real
+layer-0 qualification, the existing non-deterministic path varied by up to
+0.0009765625 across repeated 512-token MoE calls. Deterministic execution removed
+this variation: all baseline/native comparisons were exact at 1, 7, 128 and 512
+tokens, with no material timing penalty in that test. Native-1024 MoE medians
+were 14.46 vs 17.82 ms at one token and 289.74 vs 335.21 ms at 512 tokens. These
+are isolated real-layer results, not full-model throughput claims.
