@@ -758,3 +758,44 @@ The repeatable real-layer gate is `scripts/qualify_muse_native.py`; pass the
 model, native manifest, original operator library, device and output path. It
 checks every repeated result exactly under deterministic execution and reports
 synchronized medians separately for each prompt size.
+
+### Resident deployment qualification (2026-10-18)
+
+The six-chip server now listens on loopback ports **8001 and 8002** with one
+resident model, 98,304-token total context and 512-token prefill chunks. Native
+`muse_w4_v2_k1024` is active. Loading and qualifying the module on all six devices
+took **0.261 seconds**; the first full-logit dispatch switch took **6.729 seconds**.
+Native switching, a Python MoE wrapper, baseline rollback and native restoration
+all preserved the server PID and the digest of checkpoint storage addresses.
+
+Same-process deterministic comparisons, with unchanged generated text:
+
+| Measurement | Original backend | Native 1024 |
+| --- | ---: | ---: |
+| Decode, short add request | 0.789 tok/s | **0.940 tok/s** |
+| Prefill, 2,127-token prompt | 19.459 tok/s | **22.519 tok/s** |
+| Decode after that prompt | 0.776 tok/s | **0.922 tok/s** |
+| Short add, complete HTTP request | 23.180 s | **19.338 s** |
+| Long prompt, complete HTTP request | 128.636 s | **110.730 s** |
+
+The three completion regressions, 162-prompt/84-output-token chat (including
+reasoning text), and 2,127-token rollover completion all match the previous
+validated server exactly. Chat latency is 102.625 seconds versus the previous
+122.961 seconds. Chat and long-prompt addition functions each pass four arithmetic
+assertions. These remain single-request coding smokes; full-model 96K quality
+and concurrent-request throughput have not been evaluated.
+
+All 62 layers loaded with verified packed-cache hits. The cache occupies
+241,589,798,672 bytes (about 225 GiB). A separate real layer-0 CPU preparation
+comparison found every dense tensor and tiled bank exactly equal to canonical
+loading. Across two repetitions, median preparation fell from 5.342 to 2.478
+seconds (**2.16x**). This excludes NPU transfer/NZ conversion and is not a complete
+startup speed measurement; the initial server startup overlapped cache builders.
+
+Validation includes **93 focused tests**, the reusable real-layer native gate,
+all-six-device resident projection checks, Python rollback and native failure
+handling. Frozen current and next-start runtime inventories verified 341 and
+342 source/operator/build-input files respectively. The prepared next-start
+launcher uses runtime `9988d30` and `--native-manifest` to requalify and activate
+the selected module before opening listeners; the running process retains its
+original `33230a4` Python image and the hot-loaded native module.
