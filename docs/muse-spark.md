@@ -511,8 +511,8 @@ baseline text comparisons.
 ## Bounded grouped attention and larger contexts
 
 Add `--bounded-attention --max-context 98304` to `--optimized` for the expanded
-context path. Four-query subchunks bound temporary attention score and softmax
-storage. Query heads are grouped against 16 KV heads without expanding keys and
+context path. Adaptive query subchunks bound temporary attention score and softmax
+storage, reaching four queries at a 98,304-token prefix. Query heads are grouped against 16 KV heads without expanding keys and
 values to 128 heads. Full-attention caches allocate their configured capacity
 once per request and append in place; their valid prefixes are made contiguous
 at most once per layer forward. Sliding caches retain 2,047 tokens plus room for
@@ -574,3 +574,76 @@ tokens plus 16 generated tokens completed in 317.19 seconds (296.06 prefill,
 arithmetic assertions. This establishes full-model cache rollover and generation
 beyond 2,048 tokens; the complete 96K window has not been evaluated for retrieval,
 coding quality, or end-to-end prompt latency.
+
+## Qwen and GLM performance transfers
+
+Runtime `cd18b08` builds on the existing Qwen W4 tiling and resident NZ weights:
+
+- Prefill sorts routes once, gathers all expert inputs together, then batches
+  post-expert normalization and output combination. Expert projections still
+  reuse their weights across tokens. The final sum retains ascending expert
+  order and FP16 rounding after every contribution.
+- `--optimized --bounded-attention` accepts prefill chunks up to 512 tokens.
+  Individual expert GEMMs remain split into at most 128 rows, respecting the
+  installed operator's limit. The larger sliding-cache append area is included
+  in placement planning; maximum context stays at 98,304.
+- Grouped attention batches more queries for short prefixes, with a fixed score
+  budget of at most `32 * min(max_context, 98304)` elements per KV head. It keeps
+  the previous four-query geometry at a full 96K prefix and never expands KV
+  heads. Injected operators retain their previous conservative geometry.
+- Each stage shares rotary phases for the current position range. Centered norm
+  weights and residual-gate coefficients are prepared once instead of rebuilt
+  during every forward.
+- Aligned FP16 rows use the installed NPU RMS operator. A hardware ablation found
+  invalid, unstable results for width-eight rows; unaligned rows and other dtypes
+  use the reference math. The real Muse widths (64, 4096, 8192) passed checks at
+  both RMS epsilon values, including small inputs.
+
+These changes preserve the checkpoint, W4 expert codes/scales, top-eight routing,
+FP16 activations and KV caches, native RoPE, and sliding-window semantics.
+Fused RMS and different GEMM/attention shapes can change FP16 rounding, so the
+runtime does not promise identical tokens for every prompt.
+
+On the real first layer, median decode time decreased from 21.59 to 20.23 ms.
+The 64-token prefill decreased from 169.75 to 152.38 ms; 512 tokens took 366.67 ms,
+about 3.7 times the old 64-token per-layer throughput. These isolated-layer
+measurements do not establish full-model throughput. Native cached-layer maximum
+error remained 0.0078125. The corrected six-chip synthetic run matched the native
+greedy IDs `[26, 4, 9]`, with maximum logit error 0.0006104. All 89 focused tests
+passed, including large expert groups, causal masks, poisoned unused cache
+capacity, position-cache reuse, and placement admission.
+`scripts/qualify_muse_rms.py --device npu:0 --output rms-checks.json` reproduces
+the RMS hardware gate with CANN sourced and `PYTHONPATH=src`; all 84 combinations
+passed on this host, each repeated three times, including weighted normalization
+and zero inputs.
+
+The frozen runtime completed full-model deployment with
+`--optimized --bounded-attention --max-context 98304 --prefill-chunk 512`.
+The same requests were compared with the previous 96K runtime (`ab28485`):
+
+| Request | Previous seconds | New seconds |
+| --- | ---: | ---: |
+| Add, 7 prompt / 16 output | 25.16 | 23.31 |
+| Reverse, 6 prompt / 8 output | 13.91 | 12.85 |
+| Factorial, 15 prompt / 8 output | 16.96 | 15.51 |
+| Chat, 162 prompt / 84 output | 151.77 | 122.96 |
+| Sliding rollover, 2,127 prompt / 16 output | 317.19 | 128.69 |
+
+All three completions, the full chat message (including reasoning), and the
+long-prompt completion matched the previous text. Chat and long-prompt addition
+functions each passed four arithmetic assertions. On the 2,127-token prompt,
+prefill fell from 296.06 to 109.24 seconds: **7.18 to 19.47 prompt tokens/s,
+2.71x faster**. Decode improved from 0.733 to 0.784 tokens/s on the short add
+request and 0.710 to 0.771 on the longer prompt. Decode rates count the generated
+tokens after the first token, which comes from prefill. HTTP times include both
+phases. These are single-request measurements; they do not measure concurrent
+request throughput or full-96K retrieval/quality. Final health, configured cache
+capacity, and all 86 frozen source/operator file hashes were checked.
+
+The Qwen/GLM sources also contain model-specific recurrent attention, sparse
+attention, MTP state handling, and native W4A8 paths. Those are not drop-in Muse
+operations: W4A8 changes activation precision, and MTP needs a compatible draft
+model plus accepted/rejected-cache handling. This deployment retains W4A16 and
+sequential layer placement. Cross-request batching and TP/EP execution require
+a separate scheduler and distributed model adapter; they are not enabled by
+increasing the prefill chunk.
