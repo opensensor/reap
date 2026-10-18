@@ -847,4 +847,51 @@ memory. Captured outputs keep their own live tensor references, and ordered
 replay permits scratch reuse. Native geometry tensors created before capture
 are retained even if varying prefill sizes evict their lookup-cache entries.
 Hot switches reset graphs on their owning devices, discard retired pool handles,
-and recapture into fresh pools after switching Python or native code; storage fingerprints include every nonowner expert shard.
+and recapture into fresh pools after switching Python or native code; storage
+fingerprints include every nonowner expert shard.
+
+### Six-chip tensor deployment qualification (2026-10-18)
+
+Frozen runtime `2f816ed` is serving on ports **8001 and 8002**, with native
+`muse_w4_v2_k1024` and the additional decode graph candidate active. All 62 layers
+loaded from verified packed-cache hits. The deployment keeps 128 experts, top-8
+routing, the same quantized weights, FP16 KV, 98,304-token total context and
+512-token prefill chunks. Dense/KV stage boundaries are 0/7/19/31/43/55/62;
+every expert projection uses all six chips.
+
+| Measurement | Sequential native | Tensor experts | Tensor + decode graphs |
+| --- | ---: | ---: | ---: |
+| Short-request decode | 0.940 tok/s | 1.879 tok/s | **1.980 tok/s** |
+| Chat decode | 0.935 tok/s | 1.874 tok/s | **1.977 tok/s** |
+| Decode after 2,127 prompt tokens | 0.922 tok/s | 1.786 tok/s | **1.902 tok/s** |
+| Prefill, 2,127-token prompt | 22.519 tok/s | 31.496 tok/s | **31.891 tok/s** |
+| Short add, complete HTTP request | 19.338 s | 9.122 s | **8.709 s** |
+| Chat, complete HTTP request | 102.625 s | 49.016 s | **46.641 s** |
+| Long prompt, complete HTTP request | 110.730 s | 75.935 s | **74.586 s** |
+
+Decode counts cached steps (`completion_tokens - 1`), since prefill produces
+the first token. These are single-request timings, not concurrent throughput.
+The roughly 2.1x decode gain remains slow for interactive coding.
+
+All three completion regressions, the entire 162-prompt/84-output-token chat
+message including reasoning, and the 2,127-token rollover response match the
+previous validated server exactly. The two generated addition functions pass
+eight arithmetic assertions in total. Python patch reapplication, Python
+rollback, native rollback and restoration pass exact-logit gates while retaining
+the same process and checkpoint storage addresses. Both ports share that process.
+
+Validation includes **103 focused tests**, exact real-layer checks at
+1/7/128/512 tokens, changing decode inputs/routes, 1,200 simultaneous captured
+graphs across six chips, and four reset/recapture cycles over 62 graph groups.
+All 340 frozen runtime inventory entries passed SHA256 verification. The next
+startup launcher reapplies the native manifest and trusted Python candidate
+through the startup qualification gate. The sequential native deployment remains
+available as a rollback launcher.
+
+This is a throughput and regression qualification of the existing export, not
+a broad coding quality evaluation. Full-model context regression reaches 2,127
+prompt tokens; full 96K retrieval/quality is still unmeasured. Dynamic attention
+and dense stages remain sequential, and expert projections still gather through
+host memory. Further work should measure those costs before changing kernels or
+numerics. Local deployment evidence is in `../results/muse-opt-v4/final-summary.json`
+and the two validation summaries alongside it.
