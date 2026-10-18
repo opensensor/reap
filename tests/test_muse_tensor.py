@@ -48,14 +48,35 @@ def test_sharding_preserves_physical_nz_codes_scales_and_gate_up_order():
 
 
 @pytest.mark.parametrize("grouped", [False, True])
+@pytest.mark.parametrize("implementation", ["baseline", "resident-prefill"])
 def test_parallel_gather_preserves_expert_rows_and_uneven_column_order(
-    monkeypatch, grouped
+    monkeypatch, grouped, implementation
 ):
     # Keep the reference independent of physical W4 packing and NPU dispatch.
     torch.manual_seed(37)
     monkeypatch.setattr(
         torch, "npu", SimpleNamespace(device=lambda _: nullcontext()), raising=False
     )
+    if implementation == "resident-prefill":
+        from pathlib import Path
+
+        scope = {}
+        exec(
+            (
+                Path(__file__).parents[1]
+                / "scripts/muse_resident_patches/layer_decode_graphs.py"
+            ).read_text(),
+            scope,
+        )
+        empty = torch.empty
+
+        def cpu_empty(*args, **kwargs):
+            # CPU math/ordering test; real pinning is qualified on the NPUs.
+            kwargs.pop("pin_memory", None)
+            return empty(*args, **kwargs)
+
+        monkeypatch.setattr(torch, "empty", cpu_empty)
+        monkeypatch.setattr(TensorExperts, "project", scope["prefill_project"])
     x = torch.randn(8, 12)
     gate, up, down = [torch.randn(4, 12, 12) for _ in range(3)]
     ids = torch.tensor([0, 0, 0, 2, 2, 2, 3, 3], dtype=torch.int32)

@@ -157,12 +157,26 @@ def test_tool_none_forced_choices_and_argument_validation():
 
 
 @pytest.mark.parametrize("failure_phase", [None, "up", "down"])
+@pytest.mark.parametrize("transport", ["pipelined_project", "prefill_project"])
 def test_pipelined_experts_drain_failures_and_reuse_device_routes(
-    monkeypatch, failure_phase
+    monkeypatch, failure_phase, transport
 ):
+    synchronized = []
     monkeypatch.setattr(
-        torch, "npu", SimpleNamespace(device=lambda _: nullcontext()), raising=False
+        torch,
+        "npu",
+        SimpleNamespace(
+            device=lambda _: nullcontext(), synchronize=synchronized.append
+        ),
+        raising=False,
     )
+    empty = torch.empty
+
+    def cpu_empty(*args, **kwargs):
+        kwargs.pop("pin_memory", None)
+        return empty(*args, **kwargs)
+
+    monkeypatch.setattr(torch, "empty", cpu_empty)
     scope = {}
     exec(
         (
@@ -181,7 +195,7 @@ def test_pipelined_experts_drain_failures_and_reuse_device_routes(
         def run(self, value, routes):
             if self.rank == 2 and fault[0] == self.phase:
                 raise RuntimeError("injected rank failure")
-            if self.phase == "down":
+            if self.phase == "down" and transport == "pipelined_project":
                 assert routes is graphs[self.rank, "up"].routes
             self.routes.copy_(routes)
             return (
@@ -193,20 +207,31 @@ def test_pipelined_experts_drain_failures_and_reuse_device_routes(
     graphs = {(i, p): Graph(i, p) for i in range(3) for p in ("up", "down")}
     pool = make_pool(["cpu"] * 3)
     experts = SimpleNamespace(
-        ranks=[SimpleNamespace(device="cpu") for _ in range(3)],
+        ranks=[SimpleNamespace(device="cpu", index=i) for i in range(3)],
         graphs=graphs,
         pool=pool,
         prepare_graphs=lambda *args: None,
+        decode_graphs=False,
+        operation=lambda rank, phase, value, routes, grouped: graphs[
+            rank.index, phase
+        ].run(value, routes),
+    )
+    project = lambda x, ids: (
+        scope["prefill_project"](experts, x, ids=ids)
+        if transport == "prefill_project"
+        else scope["pipelined_project"](experts, x, ids)
     )
     try:
         x = torch.arange(24).reshape(8, 3).float()
         ids = torch.arange(8, dtype=torch.int32)
         if failure_phase:
             with pytest.raises(RuntimeError, match="injected"):
-                scope["pipelined_project"](experts, x, ids)
+                project(x, ids)
+            if transport == "prefill_project":
+                assert synchronized == ["cpu"]
             fault[0] = None
         for ids in (ids, ids.flip(0)):
-            actual = scope["pipelined_project"](experts, x, ids)
+            actual = project(x, ids)
             torch.testing.assert_close(actual, (x + ids[:, None]) * 2, rtol=0, atol=0)
     finally:
         pool.shutdown()

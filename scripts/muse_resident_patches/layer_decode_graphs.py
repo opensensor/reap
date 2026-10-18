@@ -50,6 +50,8 @@ def finish(self, projected, coefficients):
 
 
 def graph_moe(self, x):
+    if x.shape[1] > 1 and hasattr(self, "tensor_experts"):
+        return prefill_moe(self, x)
     if x.shape[1] != 1 or not hasattr(self, "tensor_experts"):
         return original_moe(self, x)
     graphs = self.tensor_experts.graphs
@@ -273,3 +275,93 @@ def pipelined_project(experts, inputs, ids):
             failures[0],
         )
     return torch.cat(results, dim=-1).to(inputs.device)
+
+
+class PrefillLayer:
+    """Keep the original MoE math while substituting its transport method."""
+
+    def __init__(self, layer):
+        self.layer = layer
+
+    def __getattr__(self, name):
+        return getattr(self.layer, name)
+
+    def expert_projection(self, routes, **metadata):
+        return prefill_project(self.layer.tensor_experts, routes, **metadata)
+
+
+def prefill_moe(self, x):
+    return original_moe(PrefillLayer(self), x)
+
+
+_prefill_staging = {}
+
+
+def prefill_project(self, inputs, *, ids=None, ends=None):
+    if (ids is None) == (ends is None):
+        raise ValueError("provide routed IDs or grouped ends")
+    device = inputs.device
+    host_inputs = inputs.cpu()
+    host_routes = (ids if ids is not None else ends).cpu()
+    use_graph = self.decode_graphs and ids is not None and len(inputs) == 8
+    if use_graph:
+        self.prepare_graphs(host_inputs, host_routes)
+
+    def run(i, phase, value):
+        rank = self.ranks[i]
+        with torch.inference_mode(), torch.npu.device(rank.device):
+            routes = host_routes
+            try:
+                if use_graph:
+                    result = self.graphs[i, phase].run(value, routes)
+                else:
+                    result = self.operation(
+                        rank,
+                        phase,
+                        value.to(rank.device, non_blocking=True),
+                        routes.to(rank.device, non_blocking=True),
+                        ends is not None,
+                    )
+                return result.cpu()
+            except BaseException:
+                # Pinned source buffers must not be reused while DMA reads
+                # remain outstanding, including after an operator failure.
+                torch.npu.synchronize(rank.device)
+                raise
+
+    for phase in ("up", "down"):
+        # One pinned snapshot serves all ranks. Sharing pageable buffers can
+        # exhaust the host driver's partial-pin retries on concurrent uploads.
+        # Layers on a rank pool run serially; separate pools need separate
+        # buffers. Every rank finishes its blocking CPU result copy (or error
+        # synchronization) before these snapshots can be overwritten.
+        buffers = _prefill_staging.get((self.pool, phase))
+        if (
+            buffers is None
+            or buffers[0].shape != host_inputs.shape
+            or buffers[1].shape != host_routes.shape
+            or buffers[0].dtype != host_inputs.dtype
+            or buffers[1].dtype != host_routes.dtype
+        ):
+            buffers = tuple(
+                torch.empty(t.shape, dtype=t.dtype, device="cpu", pin_memory=True)
+                for t in (host_inputs, host_routes)
+            )
+            _prefill_staging[self.pool, phase] = buffers
+        buffers[0].copy_(host_inputs)
+        buffers[1].copy_(host_routes)
+        host_inputs, host_routes = buffers
+        futures = [
+            self.pool.submit(run, i, phase, host_inputs) for i in range(len(self.ranks))
+        ]
+        # Wait for every rank even on error before allowing reset/hot swap.
+        results, failures = [], []
+        for future in futures:
+            try:
+                results.append(future.result())
+            except BaseException as exc:
+                failures.append(exc)
+        if failures:
+            raise failures[0]
+        host_inputs = torch.cat(results, dim=-1)
+    return host_inputs.to(device)
