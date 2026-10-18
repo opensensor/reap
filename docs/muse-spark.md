@@ -1130,3 +1130,54 @@ CPU tests and the previous deployment's checks remain available. Evidence is in
 `tools-validation-summary.json`, `stream-validation-summary.json`,
 `pipeline-combined-performance.json` and `final-health.json` under
 `../results/muse-opt-v7`.
+
+
+### Shared pinned prefill and host-driver investigation (2026-10-18)
+
+Patch `3612570` now runs in the existing `2765412` process on ports 8001/8002.
+Prefill copies each expert phase's activations and routes into one reusable pinned
+host snapshot shared across all six ranks. Uploads remain concurrent. Every rank
+completes its CPU result copy before reuse; operator errors synchronize that rank
+and all futures are drained before propagating the failure. Separate rank pools
+have separate staging buffers. The original MoE arithmetic and decode path remain
+unchanged. Weight storage identities and the server PID were preserved.
+
+| Measurement | Baseline | Shared pinned prefill |
+| --- | ---: | ---: |
+| Cold prefill, 400 tokens | 49.011 tok/s | **59.906 tok/s** |
+| Cold prefill, 2,127 tokens | 35.376 tok/s | **55.565 tok/s** |
+| First text, 2,127 tokens | 60.130 s | **38.284 s** |
+| Decode after 2,127 tokens | 2.002 tok/s | 2.002 tok/s |
+
+The 400-token result uses three repeats per candidate and baseline measurements
+before and after: **22.23%** higher prefill throughput.
+The 2,127-token result is one same-process cold comparison, with zero cached prompt
+tokens in both runs. Each streamed completion matches the earlier reference
+exactly. A warm request reuses 2,048 tokens and returns first text in
+**2.758 seconds**. Client disconnect, subsequent exact completion,
+and repeated reset/recapture checks pass. There are **132 passing Muse tests**.
+Full-model 96K retrieval/quality and concurrent request scheduling remain untested.
+
+The faster pageable-sharing experiment was rejected after `aclrtMemcpy` error
+107017 during repeated resident probes. Kernel tracing exposed repeated partial
+pins: **19 of 65 requested pages** from a valid 256 KiB anonymous buffer. The
+vendor wrapper unpins the partial result and retries the whole range five times,
+then reports zero and returns `-EFAULT`; its log obscured the partial progress.
+This does not establish why Linux stops at that page. Serializing uploads lost
+the performance gain. Shared pinned staging passed the checks above without new
+Ascend kernel errors and retains concurrent uploads.
+
+The separate host-driver fork has diagnostic commit
+[`5f2a44a`](https://github.com/opensensor/ascend-310p-host-driver/commit/5f2a44a):
+raw negative errors and exhausted partial-pin results are logged, with a targeted
+BPF trace and pin-ownership regression tests. All 18 driver tests and verification
+of 31 Linux 7.0.0-38 modules pass. Those kernel changes are **not installed** and
+are not a validated fix for the underlying partial-pin failure.
+
+The frozen next-start runtime is `runtime-3612570`, with 425 verified files and
+launcher `launch-muse-prefill-v8.sh`; the currently loaded base image stays
+`2765412` to avoid reloading weights. Native `muse_w4_v2_k1024`, context 98,304,
+prefill chunk 512, tools and streaming remain enabled. Rollback uses
+`launch-muse-tools-v7.sh` or its original resident Python patch. Evidence is in
+`prefill-shared-safe-performance.json`, `shared-pinned-long-validation.json`,
+`driver-debug.json` and `final-health.json` under `../results/muse-opt-v8`.
