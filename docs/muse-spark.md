@@ -2,8 +2,9 @@
 
 This implementation collects pruning statistics from unquantized eager Muse MoEs,
 slices retained experts in memory, and streams text calibration from indexed
-safetensors on CPU. It is not a complete 816B checkpoint conversion or serving
-pipeline.
+safetensors on CPU. It also exports a frozen pruning plan through ModelSlim into
+a custom W4-expert/W8-attention deployment format. The serving adapter remains
+separate work; the exported checkpoint cannot be loaded by stock vLLM.
 
 ## Implemented
 
@@ -90,8 +91,8 @@ The pruning adapter itself imports no Muse-specific Transformers implementation.
 The streaming runner deliberately uses native Muse classes and native mask/RoPE
 builders from the compatible environment.
 
-Merging metrics, packed NVFP4/int4 weights, adaptive per-layer expert counts,
-shard-streaming export, full-model generation quality, and Ascend/CANN kernels
+Merging metrics, quantized source checkpoints, adaptive per-layer expert counts,
+full-model generation quality, and a complete Ascend serving runtime
 are not supported by this change. Registering the model attributes does not
 establish support for other REAP merging/conversion paths.
 
@@ -289,3 +290,53 @@ HF_HUB_OFFLINE=1 CUDA_VISIBLE_DEVICES='' PYTHONPATH=src python -m pytest -q \
 3. Evaluate W4 quantization and the Ascend backend independently. Pruning quality,
    quantization quality, simulator parity, and actual device allocation/throughput
    are separate checks. Keeping top-8 does not halve active expert computation.
+
+## ModelSlim export for Ascend bring-up
+
+`reap.muse_export` reads the original BF16 checkpoint and a validated, frozen
+pruning plan. It slices retained experts directly from the source shards, then
+uses ModelSlim IR symmetric min/max round-to-nearest quantization on CPU. This
+initial export does not use activation calibration or measure quantized quality.
+
+```sh
+PYTHONPATH=src:/path/to/msmodelslim .venv-muse/bin/python -m reap.muse_export \
+  --source /models/Muse-Spark-Open-816B-A42B \
+  --plan /results/plans/weighted_ean_sum-128.json \
+  --output /models/Muse-Spark-Contribution128-W4A16-W8Attn --threads 8
+# Repeat with --resume after interruption; --stop-after-layer 1 is a smoke export.
+```
+
+The format is `muse_spark_w4a16_g128_w8attn_v1`:
+
+- Experts: signed W4, group size 128 along K, FP16 scales. Each byte packs even K
+  in the low nibble and odd K in the high nibble. Zero offsets are implicit.
+- Attention projections, including the output gate: signed W8 with FP32
+  per-output-channel scales. Activations remain floating point.
+- Other BF16 weights become FP16; source FP32 router/gate values remain FP32.
+  Router rows and correction biases follow the retained expert mapping. Shared
+  norms/projections and top-k are preserved.
+- Each layer has two expert shards split by retained expert ID and one dense
+  shard. Global embeddings, final norm, and output head have separate shards.
+  This layout anticipates EP2, but does not itself implement TP/PP execution.
+- The exporter fingerprints the source, plan, exporter, and ModelSlim backend;
+  resume verifies completed shard checksums. It publishes the index last and
+  explicitly marks `deployment.json` as `serving_ready: false`.
+
+The deployment candidate is contribution-weighted pruning with 128 retained
+experts per layer (top-8 routing unchanged), selected from the coding pilot. The
+next acceptance milestone is a generated response on six Ascend 310P chips,
+followed by an HTTP endpoint and executable coding smoke checks. The intended
+layout is TP2/PP3/EP2; memory capacity and numerical parity must be verified on
+the actual runtime before declaring this configuration usable.
+
+`reap.muse_qualify prepare --export EXPORT --output PROBE` extracts three real
+quantized expert projections and CPU FP16 references. On the Ascend host,
+`reap.muse_qualify run --data PROBE --library EXTENSION.so --output RESULT.json`
+compares an existing W4 operator against those references at token counts
+1, 17, 128, and 129. `--tokens`, `--rows`, and `--projection` select smaller cases
+for CANN simulator runs. The adapter chunks K at 2048 and M at 128 to fit
+the existing Qwen operator, accumulating FP16 partial products in FP32. This
+adds launches and partial-product rounding; it is an initial bring-up path. The
+result records checksums and loaded simulator libraries. An existing Qwen extension may reject Muse dimensions: a successful
+import or simulator startup alone does not qualify the kernel. This probe tests
+same-quantized matrix multiplication, not end-to-end model quality.
