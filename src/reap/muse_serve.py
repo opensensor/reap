@@ -250,6 +250,7 @@ def main():
     parser.add_argument("--packed-cache", type=Path)
     parser.add_argument("--resident-token-file", type=Path)
     parser.add_argument("--native-manifest", type=Path)
+    parser.add_argument("--resident-patch-file", type=Path)
     args = parser.parse_args()
     if args.bounded_attention and (not args.optimized or args.max_context < 1):
         parser.error("--bounded-attention requires --optimized and positive context")
@@ -263,6 +264,12 @@ def main():
 
         native_manifest = json.loads(args.native_manifest.read_text())
         check_manifest(native_manifest)
+    source = None
+    if args.resident_patch_file:
+        if not args.resident_token_file:
+            parser.error("--resident-patch-file requires --resident-token-file")
+        source = args.resident_patch_file.read_text()
+        compile(source, str(args.resident_patch_file), "exec")
     token = None
     if args.resident_token_file:
         token = args.resident_token_file.read_text().strip()
@@ -305,9 +312,14 @@ def main():
         resident = Resident(runtime)
         if native_manifest:
             resident.load_native(native_manifest)
-            receipt = resident.switch(native=native_manifest["name"])
+        if native_manifest or source:
+            receipt = resident.switch(
+                native=native_manifest["name"] if native_manifest else None,
+                source=source,
+            )
             print(
-                json.dumps({"event": "startup_native_activated", **receipt}), flush=True
+                json.dumps({"event": "startup_resident_activated", **receipt}),
+                flush=True,
             )
     config = uvicorn.Config(
         create_app(

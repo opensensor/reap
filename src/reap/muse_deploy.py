@@ -104,7 +104,12 @@ def run(args):
                 command.append("--optimized")
             if args.bounded_attention:
                 command.append("--bounded-attention")
-            for option in ("packed_cache", "resident_token_file", "native_manifest"):
+            for option in (
+                "packed_cache",
+                "resident_token_file",
+                "native_manifest",
+                "resident_patch_file",
+            ):
                 if getattr(args, option, None):
                     command.extend(
                         ["--" + option.replace("_", "-"), str(getattr(args, option))]
@@ -206,6 +211,7 @@ def main():
     parser.add_argument("--packed-cache", type=Path)
     parser.add_argument("--resident-token-file", type=Path)
     parser.add_argument("--native-manifest", type=Path)
+    parser.add_argument("--resident-patch-file", type=Path)
     args = parser.parse_args()
     if args.bounded_attention and (not args.optimized or args.max_context < 1):
         parser.error("--bounded-attention requires --optimized and positive context")

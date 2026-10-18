@@ -15,6 +15,24 @@ import torch.nn.functional as F
 from reap.muse_fast import FastMuseLayer, TiledBank, native_weight
 
 
+_GRAPH_CONTEXTS = {}
+
+
+def graph_context(device):
+    # A separate expandable allocator pool per graph reserves a device-sized
+    # virtual segment. Hundreds of graphs exhaust the driver's address space.
+    # Captures/replays are ordered and outputs stay owned by each DecodeGraph;
+    # sharing one pool and capture stream per device safely reuses scratch.
+    device = torch.device(device)
+    if device not in _GRAPH_CONTEXTS:
+        with torch.npu.device(device):
+            _GRAPH_CONTEXTS[device] = (
+                torch.npu.graph_pool_handle(),
+                torch.npu.Stream(device=device),
+            )
+    return _GRAPH_CONTEXTS[device]
+
+
 def partitions(size, ranks, rotation=0, alignment=128):
     if ranks < 1 or alignment < 1 or size % alignment or size // alignment < ranks:
         raise ValueError("invalid aligned partition geometry")
@@ -54,6 +72,7 @@ class DecodeGraph:
     graph: object
     output: torch.Tensor
     stream: object
+    retained: tuple = ()
 
     @classmethod
     def capture(cls, function, inputs, routes):
@@ -66,8 +85,8 @@ class DecodeGraph:
             graph = torch.npu.NPUGraph()
             # torch.npu.graph's default capture stream is process-global, not
             # device-local. Explicit streams are required for all six captures.
-            stream = torch.npu.Stream(device=inputs.device)
-            with torch.npu.graph(graph, stream=stream):
+            pool, stream = graph_context(inputs.device)
+            with torch.npu.graph(graph, pool=pool, stream=stream):
                 output = function(inputs, routes)
             graph.replay()
             torch.npu.synchronize(inputs.device)
@@ -128,6 +147,14 @@ class TensorExperts:
                             inputs.to(rank.device),
                             routes.to(rank.device),
                         )
+                        backend = (
+                            rank.gate_up.backend if phase == "up" else rank.down.backend
+                        )
+                        if backend is not None:
+                            # Native geometry tensors are allocated during warmup,
+                            # outside the graph pool. Pin them through replay even
+                            # when varied prefill sizes evict the backend's LRU.
+                            self.graphs[key].retained = tuple(backend.geometry.values())
 
     def project(self, inputs, *, ids=None, ends=None):
         if (ids is None) == (ends is None):

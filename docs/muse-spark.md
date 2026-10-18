@@ -799,3 +799,51 @@ handling. Frozen current and next-start runtime inventories verified 341 and
 launcher uses runtime `9988d30` and `--native-manifest` to requalify and activate
 the selected module before opening listeners; the running process retains its
 original `33230a4` Python image and the hot-loaded native module.
+
+### Tensor-parallel experts and decode graphs
+
+`--tensor-experts` distributes the output channels of every expert projection
+across all configured NPUs. Attention, dense projections, and KV remain on
+contiguous stages. The memory planner balances those stages again after dividing
+expert weights; it includes the requested full/sliding KV capacity and reserve.
+Unequal 128-channel partitions rotate between devices across layers. Gates and
+up projections use matching partitions; down projections gather complete output
+vectors before the shared normalization and ordered expert sum.
+
+This keeps all 128 experts, top-8 routing, W4 weights, FP16 activations, and the
+existing split-K rounding. It requires neither activation quantization nor
+cross-device floating-point reductions. Two host gathers connect the parallel
+expert projections. Persistent worker threads execute all NPU shards together;
+single-token decode replays captured projection graphs. Grouped prefill retains
+the eager native path and handles up to 512 tokens per chunk.
+
+For additional decode graph coverage, pass the included trusted candidate:
+
+```bash
+python -m reap.muse_serve \
+  --model /path/to/export --library /path/to/vllm_ascend_C.so \
+  --devices npu:0 npu:1 npu:2 npu:3 npu:4 npu:5 \
+  --optimized --bounded-attention --tensor-experts --deterministic \
+  --max-context 98304 --prefill-chunk 512 \
+  --packed-cache /path/to/cache \
+  --resident-token-file /private/token \
+  --native-manifest /absolute/path/manifest.json \
+  --resident-patch-file scripts/muse_resident_patches/tensor_decode_graphs.py \
+  --port 8001 --additional-port 8002
+```
+
+The candidate captures the decode router, expert combination, attention input
+projections/RoPE, and attention output projections. Attention scores, masks, and
+KV appends remain dynamic. Every replay updates activation, route, coefficient,
+and rotary buffers. The startup option applies the same exact-logit gate as a
+hot switch before opening listeners. The candidate can also be installed with
+`muse_resident_control.py switch --native NAME --candidate FILE`.
+
+Captures share one memory pool and an explicit capture stream per device.
+Individual graph pools exhausted the driver's virtual address reservations at
+full-model scale with the expandable allocator, despite sufficient weight
+memory. Captured outputs keep their own live tensor references, and ordered
+replay permits scratch reuse. Native geometry tensors created before capture
+are retained even if varying prefill sizes evict their lookup-cache entries.
+Hot switches reset graphs on their owning devices and recapture after switching
+Python or native code; storage fingerprints include every nonowner expert shard.

@@ -173,3 +173,71 @@ def test_memory_plan_conserves_weights_offsets_globals_and_full_context():
     assert all(
         a["last_layer_exclusive"] == b["first_layer"] for a, b in zip(plan, plan[1:])
     )
+
+
+def test_decode_captures_share_device_pool_and_keep_independent_outputs(monkeypatch):
+    import sys
+    from reap import muse_tensor as module
+
+    allocations, captures = [], []
+
+    def pool_handle():
+        value = object()
+        allocations.append(value)
+        return value
+
+    def capture(graph, *, pool, stream):
+        captures.append((pool, stream))
+        return nullcontext()
+
+    fake = SimpleNamespace(
+        device=lambda _: nullcontext(),
+        synchronize=lambda _: None,
+        graph_pool_handle=pool_handle,
+        Stream=lambda **_: object(),
+        NPUGraph=lambda: SimpleNamespace(replay=lambda: None),
+        graph=capture,
+    )
+    monkeypatch.setattr(torch, "npu", fake, raising=False)
+    monkeypatch.setitem(sys.modules, "torch_npu", SimpleNamespace())
+    monkeypatch.setattr(module, "_GRAPH_CONTEXTS", {})
+    x, routes = torch.ones(8, 128), torch.arange(8)
+    a = module.DecodeGraph.capture(lambda x, _: x * 2, x, routes)
+    b = module.DecodeGraph.capture(lambda x, _: x * 3, x, routes)
+    assert len(allocations) == 1 and captures[0] == captures[1]
+    assert a.output.data_ptr() != b.output.data_ptr()
+    assert (a.output == 2).all() and (b.output == 3).all()
+
+
+def test_native_geometry_survives_lru_eviction_until_graph_reset(monkeypatch):
+    import weakref
+    from reap import muse_tensor as module
+
+    monkeypatch.setattr(
+        torch,
+        "npu",
+        SimpleNamespace(device=lambda _: nullcontext(), synchronize=lambda _: None),
+        raising=False,
+    )
+    backend = SimpleNamespace(
+        geometry={"native": torch.tensor([8, 1280, 2048, 128, 0])}
+    )
+    ref = weakref.ref(backend.geometry["native"])
+
+    def capture(function, inputs, routes):
+        return SimpleNamespace(
+            inputs=inputs, graph=SimpleNamespace(reset=lambda: None), retained=()
+        )
+
+    monkeypatch.setattr(module.DecodeGraph, "capture", capture)
+    rank = SimpleNamespace(
+        device="cpu",
+        gate_up=SimpleNamespace(backend=backend),
+        down=SimpleNamespace(backend=backend),
+    )
+    tp = TensorExperts([rank], None)
+    tp.prepare_graphs(torch.ones(8, 256), torch.arange(8))
+    backend.geometry.clear()
+    assert ref() is not None
+    tp.invalidate_graphs()
+    assert ref() is None
