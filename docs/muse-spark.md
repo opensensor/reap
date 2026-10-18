@@ -1079,3 +1079,33 @@ injected-operator paths retain explicit masks. FP16 attention arithmetic, KV
 precision, expert selection and context capacity are unchanged. CPU tests compare
 exact masked/unmasked outputs with poisoned unused cache capacity, and emulate
 static graph storage across changed inputs, requests and graph recapture.
+
+The expanded-graph patch also submits each expert rank once for both projection
+phases. A barrier gathers the gate/up shards before down projection; down reuses
+the rank's existing device route IDs instead of copying them from the host again.
+Failures abort the barrier and drain all rank futures before cache cleanup or
+resident switching. In one resident worker, three-repeat short decode medians
+were 2.017 tok/s before, 2.093 tok/s with the combined patch, and 2.002 tok/s after
+restoring the old path (4.15% over the mean of the baseline medians). Responses
+and resident probe logits matched exactly. The earlier isolated layer improvement
+of 11–13% did not transfer directly to full-model throughput; expanded graphs
+plus mask removal alone measured only about 1.4% on the short full-model test.
+Evidence is under `../results/muse-opt-v7`.
+
+### Function-tool request compatibility
+
+Chat completions accept OpenAI `tools`, `tool_choice: "auto"` (the default) or
+`"none"`, `parallel_tool_calls`, assistant `tool_calls`, and tool-result messages
+with `tool_call_id`. Definitions reach Muse's native chat template. Incoming JSON
+argument strings become mappings as that template requires. Generated native
+ATEM calls become API `tool_calls` with JSON arguments and `finish_reason:
+"tool_calls"`; text and reasoning retain their streaming behavior. Function-call
+deltas are emitted once the generated call is complete, so partial ATEM markup
+is never sent as a tool invocation. The client executes tools.
+
+`tool_choice: "required"` and named forced choices return an explicit 400 because
+constrained tool selection is not implemented. Tool fields on text-completion
+requests also return 400. This compatibility fix does not drop the client's tool
+definitions or change the Kilo configuration. Tests cover the reported ordinary
+chat request with tools, streamed calls, typed arguments, history round trips,
+and the existing disconnect/cache behavior.

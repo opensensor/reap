@@ -1,7 +1,7 @@
 """Minimal single-request, greedy OpenAI-compatible Muse text endpoint.
 
 This server implements streaming and non-streaming completions and text chat. It uses
-the exported tokenizer/chat template and does not claim tool or vision support.
+the exported tokenizer/chat template, including function tools. Vision is unsupported.
 """
 
 import argparse
@@ -21,11 +21,16 @@ from fastapi import FastAPI, HTTPException, Request as HTTPRequest
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from reap.muse_tools import Tool, ToolCall, active_tools, extract_calls, strip_calls
+
 
 class Message(BaseModel):
     model_config = ConfigDict(extra="forbid")
     role: str
-    content: str
+    content: str | None = None
+    tool_calls: list[ToolCall] | None = None
+    tool_call_id: str | None = None
+    name: str | None = None
     reasoning_content: str | None = None
 
     @field_validator("content", mode="before")
@@ -61,26 +66,37 @@ class Request(BaseModel):
     stream: bool = False
     stream_options: StreamOptions | None = None
     reasoning_effort: str = "low"
+    tools: list[Tool] | None = None
+    tool_choice: str | dict | None = None
+    parallel_tool_calls: bool = True
 
 
-def parse_response(text):
-    """Separate Muse's self/user channels, preserving a truncated body."""
+def parse_response(text, tools=None, *, final=True):
+    """Separate Muse channels and translate completed native function calls."""
     message = "<|start|>assistant" + text
     matches = re.findall(
-        r"<\|start\|>assistant(?:\s+to=(self|user|commentary))?<\|message\|>(.*?)(?=<\|eom\|>|<\|eot\|>|<\|end_of_text\|>|$)",
+        r"<\|start\|>assistant(?:\s+to=([^\s<]+))?<\|message\|>(.*?)(?=<\|eom\|>|<\|eot\|>|<\|end_of_text\|>|$)",
         message,
         re.S,
     )
-    content = "".join(body for channel, body in matches if channel != "self")
-    reasoning = "".join(body for channel, body in matches if channel == "self")
+    content, reasoning, calls = [], [], []
+    for channel, body in matches:
+        if channel == "self":
+            reasoning.append(body)
+        else:
+            if tools and final:
+                calls.extend(extract_calls(body, tools))
+            if channel in ("", "user", "commentary"):
+                content.append(strip_calls(body) if tools else body)
     return {
         "role": "assistant",
-        "content": content,
-        **({"reasoning_content": reasoning} if reasoning else {}),
+        "content": "".join(content),
+        **({"reasoning_content": "".join(reasoning)} if reasoning else {}),
+        **({"tool_calls": calls} if calls else {}),
     }
 
 
-def visible_stream_text(tokenizer, tokens, chat, final=False):
+def visible_stream_text(tokenizer, tokens, chat, final=False, tools=None):
     text = tokenizer.decode(
         tokens, skip_special_tokens=not chat, clean_up_tokenization_spaces=False
     )
@@ -94,11 +110,22 @@ def visible_stream_text(tokenizer, tokens, chat, final=False):
                     if text.endswith(marker[:size]):
                         text = text[:-size]
                         break
-    return parse_response(text) if chat else {"text": text}
+    return parse_response(text, tools, final=final) if chat else {"text": text}
 
 
 def streaming_response(
-    runtime, tokenizer, ids, limit, eos, chat, model_name, lock, *, include_usage=False
+    runtime,
+    tokenizer,
+    ids,
+    limit,
+    eos,
+    chat,
+    model_name,
+    lock,
+    *,
+    include_usage=False,
+    tools=None,
+    parallel_tool_calls=True,
 ):
     """Keep one device worker and request lock until completion or cancellation."""
     stopped = threading.Event()
@@ -188,7 +215,7 @@ def streaming_response(
                 if kind == "token":
                     tokens.append(value)
                 visible = visible_stream_text(
-                    tokenizer, tokens, chat, final=kind == "done"
+                    tokenizer, tokens, chat, final=kind == "done", tools=tools
                 )
                 delta = {}
                 for key in ("content", "reasoning_content") if chat else ("text",):
@@ -202,7 +229,27 @@ def streaming_response(
                 if delta:
                     yield frame(chunk(delta))
                 if kind == "done":
-                    finish = "stop" if tokens and tokens[-1] in eos else "length"
+                    calls = visible.get("tool_calls", [])
+                    if not parallel_tool_calls and len(calls) > 1:
+                        raise ValueError(
+                            "model produced multiple calls with parallel_tool_calls=false"
+                        )
+                    if calls:
+                        yield frame(
+                            chunk(
+                                {
+                                    "tool_calls": [
+                                        {"index": i, **call}
+                                        for i, call in enumerate(calls)
+                                    ]
+                                }
+                            )
+                        )
+                    finish = (
+                        "tool_calls"
+                        if calls
+                        else ("stop" if tokens and tokens[-1] in eos else "length")
+                    )
                     yield frame(chunk({}, finish))
                     if include_usage:
                         yield frame(
@@ -273,6 +320,7 @@ def create_app(
             "prefix_cache": getattr(runtime, "prefix_cache_enabled", False),
             "deterministic": getattr(runtime, "deterministic", False),
             "streaming": True,
+            "tools": True,
             "resident": resident.status() if resident else None,
         }
 
@@ -333,24 +381,31 @@ def create_app(
             )
         if request.reasoning_effort not in ("low", "medium", "high", "xhigh"):
             raise HTTPException(400, "invalid reasoning_effort")
+        try:
+            tools = active_tools(request.tools, request.tool_choice)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        if not chat and (request.tools is not None or request.tool_choice is not None):
+            raise HTTPException(400, "tool fields require chat completions")
         if chat:
             if not request.messages or request.prompt is not None:
                 raise HTTPException(400, "chat requires messages and no prompt")
             if any(
-                m.role not in ("system", "developer", "user", "assistant")
+                m.role not in ("system", "developer", "user", "assistant", "tool")
                 for m in request.messages
             ):
                 raise HTTPException(400, "unsupported message role")
             try:
                 ids = tokenizer.apply_chat_template(
                     [
-                        m.model_dump(exclude={"reasoning_content"})
+                        m.model_dump(exclude={"reasoning_content"}, exclude_none=True)
                         for m in request.messages
                     ],
                     tokenize=True,
                     add_generation_prompt=True,
                     return_dict=False,
                     reasoning_effort=request.reasoning_effort,
+                    **({"tools": tools} if tools else {}),
                 )
             except (ValueError, TypeError) as exc:
                 raise HTTPException(400, str(exc)) from exc
@@ -381,6 +436,8 @@ def create_app(
                 include_usage=bool(
                     request.stream_options and request.stream_options.include_usage
                 ),
+                tools=tools,
+                parallel_tool_calls=request.parallel_tool_calls,
             )
         completed = False
         try:
@@ -397,13 +454,24 @@ def create_app(
         finish = "stop" if tokens and tokens[-1] in eos else "length"
         choice = {"index": 0, "finish_reason": finish}
         if chat:
-            choice["message"] = parse_response(
-                tokenizer.decode(
-                    tokens,
-                    skip_special_tokens=False,
-                    clean_up_tokenization_spaces=False,
+            try:
+                choice["message"] = parse_response(
+                    tokenizer.decode(
+                        tokens,
+                        skip_special_tokens=False,
+                        clean_up_tokenization_spaces=False,
+                    ),
+                    tools,
                 )
-            )
+            except ValueError as exc:
+                raise HTTPException(502, str(exc)) from exc
+            calls = choice["message"].get("tool_calls", [])
+            if not request.parallel_tool_calls and len(calls) > 1:
+                raise HTTPException(
+                    502, "model produced multiple calls with parallel_tool_calls=false"
+                )
+            if calls:
+                choice["finish_reason"] = "tool_calls"
         else:
             choice["text"] = tokenizer.decode(
                 tokens, skip_special_tokens=True, clean_up_tokenization_spaces=False

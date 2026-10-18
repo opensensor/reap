@@ -393,6 +393,9 @@ def test_fused_layer_graphs_preserve_static_dependencies_across_requests(
         ).read_text(),
         scope,
     )
+    scope["pipelined_project"] = lambda experts, inputs, ids: experts.project(
+        inputs, ids=ids
+    )
     runtime = MuseRuntime(exported, max_context=32, progress=lambda _: None)
 
     def make(original):

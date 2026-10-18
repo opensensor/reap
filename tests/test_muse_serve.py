@@ -73,7 +73,7 @@ def test_endpoint_contract_context_and_request_isolation():
         )
     assert (
         client.post("/v1/completions", json={"prompt": "code", "tools": []}).status_code
-        == 422
+        == 400
     )
     assert (
         client.post("/v1/completions", json={"prompt": "code", "max_tokens": 3}).json()[

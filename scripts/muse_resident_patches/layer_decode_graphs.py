@@ -204,7 +204,7 @@ def fused_layer(self, x, start=0, cache=None):
     if "layer-middle" not in graphs:
         graphs["layer-middle"] = DecodeGraph.capture(middle, attended, x)
     residual, routed, ids, coefficients = graphs["layer-middle"].run(attended, x)
-    projected = self.tensor_experts.project(routed, ids=ids)
+    projected = pipelined_project(self.tensor_experts, routed, ids)
 
     def output(projected, coefficients):
         h = finish(self, projected, coefficients)
@@ -230,3 +230,46 @@ def replacements():
         "reap.muse_fast:FastMuseLayer.attention_inputs": graph_attention_inputs,
         "reap.muse_fast:FastMuseLayer.attention_output": graph_attention_output,
     }
+
+
+def pipelined_project(experts, inputs, ids):
+    from threading import Barrier, BrokenBarrierError
+
+    host_inputs, host_routes = inputs.cpu(), ids.cpu()
+    experts.prepare_graphs(host_inputs, host_routes)
+    outputs = [None] * len(experts.ranks)
+    gathered = [None]
+
+    def combine():
+        gathered[0] = torch.cat(outputs, dim=-1)
+
+    barrier = Barrier(len(experts.ranks), action=combine, timeout=60)
+
+    def run(i):
+        rank = experts.ranks[i]
+        try:
+            with torch.inference_mode(), torch.npu.device(rank.device):
+                value, routes = host_inputs.clone(), host_routes.clone()
+                outputs[i] = experts.graphs[i, "up"].run(value, routes).cpu()
+                barrier.wait()
+                # Up and down use the same IDs on this device; avoid another
+                # host-to-device copy and its synchronization for every layer.
+                value, routes = gathered[0].clone(), experts.graphs[i, "up"].routes
+                return experts.graphs[i, "down"].run(value, routes).cpu()
+        except BaseException:
+            barrier.abort()
+            raise
+
+    futures = [experts.pool.submit(run, i) for i in range(len(experts.ranks))]
+    results, failures = [], []
+    for future in futures:
+        try:
+            results.append(future.result())
+        except Exception as exc:
+            failures.append(exc)
+    if failures:
+        raise next(
+            (exc for exc in failures if not isinstance(exc, BrokenBarrierError)),
+            failures[0],
+        )
+    return torch.cat(results, dim=-1).to(inputs.device)
