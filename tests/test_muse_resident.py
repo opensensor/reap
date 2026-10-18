@@ -116,3 +116,26 @@ def test_native_preflight_and_partial_failure(monkeypatch):
     assert r.failed and not r.loaded
     with pytest.raises(RuntimeError, match="restart required"):
         r.switch()
+
+
+def test_whole_layer_candidate_is_qualified_and_rolled_back(monkeypatch):
+    model = runtime()
+    monkeypatch.setattr(
+        FastMuseLayer, "__call__", lambda self, x: self.fast_rms(x, 1e-5)
+    )
+    model.forward = lambda ids, all_logits: model.layers[0](torch.arange(128).half())
+    resident = Resident(model)
+    monkeypatch.setattr(resident, "synchronize", lambda: None)
+    expected = model.forward([1], True)
+    source = """
+def wrong(self, x):
+    return x + 1
+
+def replacements():
+    return {"reap.muse_fast:FastMuseLayer.__call__": wrong}
+"""
+    with pytest.raises(AssertionError):
+        resident.switch(source=source)
+    assert resident.failed is None and resident.generation == 0
+    assert resident.storage_identity() == resident.identity
+    torch.testing.assert_close(model.forward([1], True), expected, rtol=0, atol=0)

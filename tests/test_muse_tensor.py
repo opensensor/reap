@@ -256,13 +256,15 @@ def test_native_geometry_survives_lru_eviction_until_graph_reset(monkeypatch):
     assert ref() is None
 
 
-def test_decode_candidate_reapplication_does_not_nest_graph_wrappers(monkeypatch):
+@pytest.mark.parametrize("candidate", ["tensor_decode_graphs", "layer_decode_graphs"])
+def test_decode_candidate_reapplication_does_not_nest_graph_wrappers(
+    monkeypatch, candidate
+):
     import importlib
     from pathlib import Path
 
     source = (
-        Path(__file__).parents[1]
-        / "scripts/muse_resident_patches/tensor_decode_graphs.py"
+        Path(__file__).parents[1] / f"scripts/muse_resident_patches/{candidate}.py"
     ).read_text()
     first = {}
     exec(source, first)

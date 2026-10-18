@@ -16,6 +16,7 @@ import torch
 from reap.muse_native import NativeW4, check_manifest
 
 TARGETS = {
+    "reap.muse_fast:FastMuseLayer.__call__",
     "reap.muse_fast:FastMuseLayer.moe",
     "reap.muse_fast:FastMuseLayer.fast_rms",
     "reap.muse_fast:FastMuseLayer.attention_inputs",

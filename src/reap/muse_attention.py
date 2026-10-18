@@ -96,28 +96,45 @@ def bounded_attention(
         score_budget = 32 * min(max_context, 98304)
         query_chunk = min(prefill_chunk, max(1, score_budget // (repeats * length)))
     outputs = []
-    key_positions = torch.arange(key.shape[-2], device=q.device) + start - previous
-    for first in range(0, count, query_chunk):
-        end = min(count, first + query_chunk)
-        positions = torch.arange(start + first, start + end, device=q.device)
-        allowed = key_positions[None, :] <= positions[:, None]
-        if window is not None:
-            allowed &= key_positions[None, :] > positions[:, None] - window
-        # The mask covers the physical capacity; actual_seq_lengths bounds the
-        # valid prefix, including when no cache is supplied.
-        out = op(
-            q[:, :, first:end].contiguous(),
-            key,
-            value,
-            atten_mask=(~allowed)[None, None].contiguous(),
-            actual_seq_lengths=[length],
-            num_heads=heads,
-            num_key_value_heads=kv_heads,
-            input_layout="BNSD",
-            scale_value=dim**-0.5,
-            inner_precise=0,
+    if count == 1 and use_grouped:
+        # The cache retains only valid past positions (at most window-1), and
+        # this append adds exactly the current position. Every key is allowed;
+        # avoid constructing and applying an all-false decode mask.
+        outputs.append(
+            op(
+                q.contiguous(),
+                key,
+                value,
+                atten_mask=None,
+                actual_seq_lengths=[length],
+                num_heads=heads,
+                num_key_value_heads=kv_heads,
+                scale_value=dim**-0.5,
+            )
         )
-        outputs.append(out)
+    else:
+        key_positions = torch.arange(key.shape[-2], device=q.device) + start - previous
+        for first in range(0, count, query_chunk):
+            end = min(count, first + query_chunk)
+            positions = torch.arange(start + first, start + end, device=q.device)
+            allowed = key_positions[None, :] <= positions[:, None]
+            if window is not None:
+                allowed &= key_positions[None, :] > positions[:, None] - window
+            # The mask covers the physical capacity; actual_seq_lengths bounds the
+            # valid prefix, including when no cache is supplied.
+            out = op(
+                q[:, :, first:end].contiguous(),
+                key,
+                value,
+                atten_mask=(~allowed)[None, None].contiguous(),
+                actual_seq_lengths=[length],
+                num_heads=heads,
+                num_key_value_heads=kv_heads,
+                input_layout="BNSD",
+                scale_value=dim**-0.5,
+                inner_precise=0,
+            )
+            outputs.append(out)
     if cache is not None:
         keep = min(length, window - 1) if window is not None else length
         if keep < length and keep:
@@ -129,7 +146,7 @@ def bounded_attention(
             )
         cache.length = keep
         cache.seen = start + count
-    return torch.cat(outputs, dim=-2)
+    return outputs[0] if count == 1 and use_grouped else torch.cat(outputs, dim=-2)
 
 
 def grouped_attention(
@@ -151,11 +168,11 @@ def grouped_attention(
     scores = (grouped @ key[:, :, :length].transpose(-1, -2)).reshape(
         1, num_heads, count, length
     ) * scale_value
-    probabilities = torch.softmax(
-        scores.masked_fill(atten_mask[..., :length], torch.finfo(query.dtype).min),
-        dim=-1,
-        dtype=torch.float32,
-    ).to(query.dtype)
+    if atten_mask is not None:
+        scores = scores.masked_fill(
+            atten_mask[..., :length], torch.finfo(query.dtype).min
+        )
+    probabilities = torch.softmax(scores, dim=-1, dtype=torch.float32).to(query.dtype)
     return (
         probabilities.reshape(1, num_key_value_heads, -1, length) @ value[:, :, :length]
     ).reshape_as(query)

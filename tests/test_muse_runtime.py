@@ -342,3 +342,97 @@ def test_prefix_placement_reserves_both_sliding_snapshots(exported):
     assert cached - plain == expected
     with pytest.raises(ValueError, match="bounded attention"):
         placement_plan(exported, ["cpu"], prefix_cache=True)
+
+
+def test_fused_layer_graphs_preserve_static_dependencies_across_requests(
+    exported, monkeypatch
+):
+    from pathlib import Path
+    from types import SimpleNamespace
+    from reap.muse_attention import AppendCache
+    from reap.muse_fast import FastMuseLayer
+    from reap.muse_tensor import DecodeGraph
+
+    class Replay:
+        # Emulate graph storage identities so stale cross-graph dependencies
+        # fail when inputs/routes change, rather than simply rerunning helpers.
+        def __init__(self, function, inputs, routes):
+            self.function = function
+            self.inputs, self.routes = inputs.clone(), routes.clone()
+
+            def clone(value):
+                return (
+                    tuple(clone(v) for v in value)
+                    if isinstance(value, tuple)
+                    else value.clone()
+                )
+
+            self.output = clone(function(self.inputs, self.routes))
+
+        def run(self, inputs, routes):
+            self.inputs.copy_(inputs)
+            self.routes.copy_(routes)
+            result = self.function(self.inputs, self.routes)
+
+            def copy(a, b):
+                if isinstance(a, tuple):
+                    for av, bv in zip(a, b, strict=True):
+                        copy(av, bv)
+                else:
+                    a.copy_(b)
+
+            copy(self.output, result)
+            return self.output
+
+    monkeypatch.setattr(DecodeGraph, "capture", Replay)
+    scope = {}
+    exec(
+        (
+            Path(__file__).parents[1]
+            / "scripts/muse_resident_patches/layer_decode_graphs.py"
+        ).read_text(),
+        scope,
+    )
+    runtime = MuseRuntime(exported, max_context=32, progress=lambda _: None)
+
+    def make(original):
+        layer = FastMuseLayer(
+            original.c, original.index, original.w, SimpleNamespace(backend=True), None
+        )
+        layer.bounded_attention, layer.max_context, layer.prefill_chunk = True, 32, 4
+
+        def project(inputs, *, ids=None, ends=None):
+            if ends is not None:
+                ids = torch.repeat_interleave(
+                    torch.arange(len(ends)),
+                    ends.diff(prepend=torch.zeros(1, dtype=ends.dtype)),
+                )
+            values = []
+            for i, expert in enumerate(ids.tolist()):
+                prefix = f"mlp.experts.{expert}."
+                x = inputs[i : i + 1]
+                gate = original.linear(prefix + "gate_proj", x, expert=True)
+                up = original.linear(prefix + "up_proj", x, expert=True)
+                values.append(
+                    original.linear(
+                        prefix + "down_proj", F.silu(gate) * up, expert=True
+                    )
+                )
+            return torch.cat(values)
+
+        layer.tensor_experts = SimpleNamespace(graphs={}, project=project)
+        return layer
+
+    torch.manual_seed(731)
+    with torch.inference_mode():
+        for original in runtime.layers:
+            baseline, candidate = make(original), make(original)
+            for request in range(3):
+                if request == 2:
+                    candidate.tensor_experts.graphs.clear()
+                caches = AppendCache(), AppendCache()
+                for start, count in [(0, 4), *[(i, 1) for i in range(4, 13)]]:
+                    x = (torch.randn(1, count, original.c.hidden_size) * 0.1).half()
+                    expected = baseline(x, start, caches[0])
+                    actual = scope["fused_layer"](candidate, x, start, caches[1])
+                    torch.testing.assert_close(actual, expected, rtol=0, atol=0)

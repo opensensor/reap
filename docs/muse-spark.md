@@ -1062,3 +1062,20 @@ a 2,048-token chunk changed some FP16 outputs. A direct peer-copy probe failed
 with an SDMA error despite reported peer capability; the serving worker remained
 functional. None of these candidates is active. `experiments.json` records the
 results and their scope.
+
+### Reducing decode launches
+
+`layer_decode_graphs.py` captures input normalization with QKV, attention output
+with the first residual and router, and expert combination with the final
+residual. Cross-graph tensors retain fixed storage until graph invalidation.
+Prefill keeps its existing path. The resident controller also qualifies and
+rolls back `FastMuseLayer.__call__` replacements, allowing whole-layer graph
+experiments without reloading weights.
+
+Single-token grouped attention skips construction/application of its all-false
+mask: the append-only full cache contains past/current positions, and the sliding
+cache retains at most the previous window minus one positions. Multi-token and
+injected-operator paths retain explicit masks. FP16 attention arithmetic, KV
+precision, expert selection and context capacity are unchanged. CPU tests compare
+exact masked/unmasked outputs with poisoned unused cache capacity, and emulate
+static graph storage across changed inputs, requests and graph recapture.
