@@ -110,6 +110,11 @@ class TensorExperts:
             with torch.npu.device(item.inputs.device):
                 torch.npu.synchronize(item.inputs.device)
                 item.graph.reset()
+                # The allocator retires this pool when its last graph resets.
+                # Reusing the old pool token then hits use_count==0 or stale
+                # virtual-memory handles. A new capture generation needs a
+                # fresh pool/stream; all layers are invalidated before replay.
+                _GRAPH_CONTEXTS.pop(item.inputs.device, None)
         self.graphs.clear()
 
     @staticmethod

@@ -195,7 +195,7 @@ def test_decode_captures_share_device_pool_and_keep_independent_outputs(monkeypa
         synchronize=lambda _: None,
         graph_pool_handle=pool_handle,
         Stream=lambda **_: object(),
-        NPUGraph=lambda: SimpleNamespace(replay=lambda: None),
+        NPUGraph=lambda: SimpleNamespace(replay=lambda: None, reset=lambda: None),
         graph=capture,
     )
     monkeypatch.setattr(torch, "npu", fake, raising=False)
@@ -207,6 +207,11 @@ def test_decode_captures_share_device_pool_and_keep_independent_outputs(monkeypa
     assert len(allocations) == 1 and captures[0] == captures[1]
     assert a.output.data_ptr() != b.output.data_ptr()
     assert (a.output == 2).all() and (b.output == 3).all()
+    tp = TensorExperts([], None)
+    tp.graphs = {"a": a, "b": b}
+    tp.invalidate_graphs()
+    module.DecodeGraph.capture(lambda x, _: x * 4, x, routes)
+    assert len(allocations) == 2 and captures[2][0] is not captures[0][0]
 
 
 def test_native_geometry_survives_lru_eviction_until_graph_reset(monkeypatch):
@@ -241,3 +246,25 @@ def test_native_geometry_survives_lru_eviction_until_graph_reset(monkeypatch):
     assert ref() is not None
     tp.invalidate_graphs()
     assert ref() is None
+
+
+def test_decode_candidate_reapplication_does_not_nest_graph_wrappers(monkeypatch):
+    import importlib
+    from pathlib import Path
+
+    source = (
+        Path(__file__).parents[1]
+        / "scripts/muse_resident_patches/tensor_decode_graphs.py"
+    ).read_text()
+    first = {}
+    exec(source, first)
+    for name, function in first["replacements"]().items():
+        module, path = name.split(":")
+        cls, method = path.split(".")
+        monkeypatch.setattr(
+            getattr(importlib.import_module(module), cls), method, function
+        )
+    second = {}
+    exec(source, second)
+    for name, function in second["replacements"]().items():
+        assert function._muse_original is first["replacements"]()[name]._muse_original

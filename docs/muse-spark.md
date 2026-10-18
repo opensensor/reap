@@ -845,5 +845,5 @@ full-model scale with the expandable allocator, despite sufficient weight
 memory. Captured outputs keep their own live tensor references, and ordered
 replay permits scratch reuse. Native geometry tensors created before capture
 are retained even if varying prefill sizes evict their lookup-cache entries.
-Hot switches reset graphs on their owning devices and recapture after switching
-Python or native code; storage fingerprints include every nonowner expert shard.
+Hot switches reset graphs on their owning devices, discard retired pool handles,
+and recapture into fresh pools after switching Python or native code; storage fingerprints include every nonowner expert shard.

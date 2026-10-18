@@ -5,7 +5,7 @@ import torch.nn.functional as F
 from reap.muse_fast import FastMuseLayer, TiledBank
 from reap.muse_tensor import DecodeGraph
 
-original_moe = FastMuseLayer.moe
+original_moe = getattr(FastMuseLayer.moe, "_muse_original", FastMuseLayer.moe)
 
 
 def prepare(self, x, unused):
@@ -70,9 +70,13 @@ def graph_moe(self, x):
 
 # Also works with the initially deployed tensor runtime, whose graph container
 # predates explicit retention of native warmup metadata outside the graph pool.
-original_linear = TiledBank.linear
-original_attention_inputs = FastMuseLayer.attention_inputs
-original_attention_output = FastMuseLayer.attention_output
+original_linear = getattr(TiledBank.linear, "_muse_original", TiledBank.linear)
+original_attention_inputs = getattr(
+    FastMuseLayer.attention_inputs, "_muse_original", FastMuseLayer.attention_inputs
+)
+original_attention_output = getattr(
+    FastMuseLayer.attention_output, "_muse_original", FastMuseLayer.attention_output
+)
 
 
 def retained_linear(self, x, *, expert=None, ids=None, ends=None):
@@ -135,6 +139,17 @@ def graph_attention_output(self, attended, x):
             lambda a, b: original_attention_output(self, a, b), attended, x
         )
     return graphs["attention-output"].run(attended, x)
+
+
+# Reapplying this candidate must wrap the same original implementation, not
+# nest graph capture through the previous generation's wrapper.
+for function, original in (
+    (graph_moe, original_moe),
+    (retained_linear, original_linear),
+    (graph_attention_inputs, original_attention_inputs),
+    (graph_attention_output, original_attention_output),
+):
+    function._muse_original = original
 
 
 def replacements():
