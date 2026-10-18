@@ -106,12 +106,12 @@ class FastMuseLayer(MuseLayer):
         self.gate_up, self.down = gate_up, down
 
     def attention(self, x, start, cache=None):
-        if not getattr(self, "flash_attention", False):
+        if not getattr(self, "bounded_attention", False):
             return super().attention(x, start, cache)
-        from reap.muse_attention import flash_attention
+        from reap.muse_attention import bounded_attention
 
         q, k, v, _ = self.attention_inputs(x, start)
-        attended = flash_attention(
+        attended = bounded_attention(
             q,
             k,
             v,

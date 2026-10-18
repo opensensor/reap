@@ -62,7 +62,7 @@ def run(args):
                 args.devices,
                 args.max_context,
                 optimized=args.optimized,
-                flash_attention=args.flash_attention,
+                bounded_attention=args.bounded_attention,
                 prefill_chunk=args.prefill_chunk,
             )
             while True:
@@ -97,8 +97,8 @@ def run(args):
             ]
             if args.optimized:
                 command.append("--optimized")
-            if args.flash_attention:
-                command.append("--flash-attention")
+            if args.bounded_attention:
+                command.append("--bounded-attention")
             with (args.state_dir / "server.log").open("a") as log:
                 child = subprocess.Popen(
                     command,
@@ -187,14 +187,10 @@ def main():
     parser.add_argument("--prefill-chunk", type=int, default=64)
     parser.add_argument("--port", type=int, default=8002)
     parser.add_argument("--optimized", action="store_true")
-    parser.add_argument("--flash-attention", action="store_true")
+    parser.add_argument("--bounded-attention", action="store_true")
     args = parser.parse_args()
-    if args.flash_attention and (
-        not args.optimized or not 1 <= args.max_context <= 65536
-    ):
-        parser.error(
-            "--flash-attention requires --optimized and context between 1 and 65536"
-        )
+    if args.bounded_attention and (not args.optimized or args.max_context < 1):
+        parser.error("--bounded-attention requires --optimized and positive context")
     if any(not device.startswith("npu:") for device in args.devices):
         parser.error("deployment supervisor requires explicit NPU devices")
     run(args)

@@ -449,8 +449,8 @@ including prompt processing and first-request overhead. Its aggregate output
 rate was about 0.138 tokens/second; this is not a steady-state decode benchmark.
 During generation, `npu-smi` reported server process memory of approximately
 34.6–40.6 GiB per chip, with the highest total device usage about 41.8 GiB.
-The server exposes an 8,192-token limit, but long-context capacity and quality
-have not yet been tested. Quantized coding quality, longer-context correctness,
+That initial deployment exposed an 8,192-token limit. The optimized path and
+larger-cache qualification are documented below; long-context quality remains untested. Quantized coding quality, longer-context correctness,
 and performance optimization remain outstanding.
 
 The full-model `/v1/chat/completions` smoke also returned HTTP 200, correctly
@@ -508,32 +508,40 @@ assertions. These are latency and regression smokes, not a coding benchmark.
 `scripts/benchmark_muse_http.py` records requests, responses, timings, and optional
 baseline text comparisons.
 
-## Fused attention and 64K context
+## Bounded grouped attention and larger contexts
 
-Add `--flash-attention --max-context 65536` to `--optimized` to use the installed
-310P BNSD incremental fused-attention kernel. Muse's eight query heads per KV head
-permit four query tokens per kernel call; larger prefill chunks are split while
-preserving causal and sliding-window masks. Keys and values remain at 16 heads,
-without expansion to 128 heads or materialized attention score/probability
-matrices. Full-attention caches allocate their configured capacity once per
-request and append in place. Sliding caches retain 2,047 tokens plus room for one
-prefill chunk, included in the placement budget. All KV values remain FP16.
+Add `--bounded-attention --max-context 98304` to `--optimized` for the expanded
+context path. Four-query subchunks bound temporary attention score and softmax
+storage. Query heads are grouped against 16 KV heads without expanding keys and
+values to 128 heads. Full-attention caches allocate their configured capacity
+once per request and append in place; their valid prefixes are made contiguous
+at most once per layer forward. Sliding caches retain 2,047 tokens plus room for
+one prefill chunk, included in the placement budget. All KV values remain FP16.
+Native RoPE and the checkpoint's 2,048-token sliding window are unchanged.
 
-The checkpoint's native position limit is 1,048,576. This implementation exposes
-at most **65,536 total prompt plus generated tokens**: the installed 310P kernel
-rejects longer sequences. Extending beyond this limit requires a different
-attention implementation and a revised KV memory/offload strategy; changing a
-configuration value alone is insufficient. RoPE settings and the checkpoint's
-2,048-token sliding window are unchanged. Planning and all launch commands
-reject incompatible fused-attention options before loading weights.
+The checkpoint's native position limit is 1,048,576. The six-chip memory plan
+fits **98,304 total prompt plus generated tokens** with the existing 3 GiB
+workspace reserve per chip. This is a configured deployment target, not a claim
+that the complete window has passed retrieval or coding quality evaluation.
+A 1M FP16 KV cache for full-attention layers alone requires 64 GiB and does not fit
+the remaining resident memory; it needs an offload or cache-compression strategy.
 
-Hardware checks compared four query tokens at a 65,536-token prefix against an
-independent grouped attention reference (maximum absolute error 0.000003815).
-A short valid prefix inside a 65,536-token allocation also passed with unused
-storage filled with NaNs. Real first-layer checks exercised full and incremental
-forwards, sliding and full caches. Fused versus reference prefill maximum error
-was 0.0078125; cached versus native CPU maximum error was 0.0087891, RMSE 0.000765,
-using rtol=0.01/atol=0.01. This is a small FP16 rounding change, so full-model text
-regression checks remain necessary. CPU tests cover causal masks, sliding-window
-rollover, chunk boundaries, stable allocation, and excluded capacity. Kernel and
-cache capacity checks do not establish full-model 64K retrieval or coding quality.
+The installed 310P fused-attention kernel passed isolated 65,536-token and real
+first-layer checks, but timed out during full-model generation on device 1
+(`IncreFlashAttention`, ACL error 507014), requiring an in-band card reset.
+Production uses standard grouped matrix operations instead. The fused launch
+option is removed so the isolated check cannot be mistaken for deployment
+qualification. Its 65,536-token kernel limit does not apply to grouped attention.
+
+CPU tests compare grouped outputs against an independent repeated-KV reference,
+including causal masks, sliding-window rollover, chunk boundaries, stable cache
+allocation, and NaN-poisoned excluded capacity. On hardware, a four-query 98,304-token comparison matched the grouped reference
+exactly. Real-layer prefill errors were 0.0009766 for sliding attention and zero
+for full attention; cached native-reference maximum error was 0.0078125, with
+RMSE 0.000689, matching the reference runtime's tolerance. Full-model results
+are recorded after deployment qualification. Capacity and trivial coding checks do not
+establish long-context retrieval or coding quality.
+
+The grouped path also passed synthetic cached and full forwards across all six
+chips from a worker thread (maximum logit error 0.0006104) and generated the same
+three greedy token IDs as native CPU. All 83 focused Muse tests passed.

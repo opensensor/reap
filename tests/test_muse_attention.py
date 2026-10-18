@@ -1,6 +1,6 @@
 import pytest
 import torch
-from reap.muse_attention import AppendCache, flash_attention
+from reap.muse_attention import AppendCache, bounded_attention, grouped_attention
 
 
 def reference(q, k, v, allowed):
@@ -16,7 +16,8 @@ def reference(q, k, v, allowed):
 
 
 @pytest.mark.parametrize("window", [None, 1, 4])
-def test_fused_cache_matches_causal_reference_across_appends(window):
+@pytest.mark.parametrize("injected", [False, True])
+def test_bounded_cache_matches_causal_reference_across_appends(window, injected):
     torch.manual_seed(17)
     q = torch.randn(1, 16, 17, 16).half() * 0.2
     k = torch.randn(1, 2, 17, 16).half() * 0.2
@@ -35,19 +36,14 @@ def test_fused_cache_matches_causal_reference_across_appends(window):
         assert (
             query.shape[-2] * 8 <= 32 and key.is_contiguous() and value.is_contiguous()
         )
-        return reference(
-            query,
-            key[:, :, :length],
-            value[:, :, :length],
-            ~kw["atten_mask"][..., :length],
-        )
+        return grouped_attention(query, key, value, **kw)
 
     parts = []
     start = 0
     pointer = None
     for count in (5, 1, 3, 5, 3):
         parts.append(
-            flash_attention(
+            bounded_attention(
                 q[:, :, start : start + count],
                 k[:, :, start : start + count],
                 v[:, :, start : start + count],
@@ -56,7 +52,7 @@ def test_fused_cache_matches_causal_reference_across_appends(window):
                 window=window,
                 max_context=32,
                 prefill_chunk=5,
-                op=op,
+                op=op if injected else None,
             )
         )
         if pointer is not None:
@@ -69,9 +65,9 @@ def test_fused_cache_matches_causal_reference_across_appends(window):
         cache.value[:, :, cache.length :].fill_(float("nan"))
     # Chunk shapes change FP16 accumulation rounding by up to one ULP.
     torch.testing.assert_close(torch.cat(parts, dim=-2), expected, rtol=1e-3, atol=1e-5)
-    assert len(calls) > 5 and cache.seen == 17
+    assert (not injected or len(calls) > 5) and cache.seen == 17
     with pytest.raises(ValueError, match="contiguous"):
-        flash_attention(
+        bounded_attention(
             q[:, :, :1],
             k[:, :, :1],
             v[:, :, :1],
@@ -83,8 +79,10 @@ def test_fused_cache_matches_causal_reference_across_appends(window):
         )
 
 
-def test_fused_context_guard_precedes_operator():
+def test_bounded_context_guard_precedes_operator():
     q = torch.zeros(1, 16, 1, 16).half()
     k = torch.zeros(1, 2, 1, 16).half()
     with pytest.raises(ValueError, match="context"):
-        flash_attention(q, k, k, start=0, max_context=65537, op=lambda *a, **kw: None)
+        bounded_attention(
+            q, k, k, start=65536, max_context=65536, op=lambda *a, **kw: None
+        )

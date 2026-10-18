@@ -184,12 +184,12 @@ def test_optimized_placement_is_available_offline_and_accounts_for_weights(expor
         placement_plan(exported, ["npu:00", "npu:0"])
 
 
-def test_fused_placement_includes_sliding_append_capacity(exported):
+def test_bounded_placement_includes_sliding_append_capacity(exported):
     config = configuration(json.loads((exported / "config.json").read_text()))
     common = dict(max_context=16, reserve_gib=0, optimized=True)
     plain = placement_plan(exported, ["cpu"], **common)[0]["required_bytes"]
     fused = placement_plan(
-        exported, ["cpu"], flash_attention=True, prefill_chunk=4, **common
+        exported, ["cpu"], bounded_attention=True, prefill_chunk=4, **common
     )[0]["required_bytes"]
     sliding_layers = config.layer_types.count("sliding_attention")
     extra_tokens = min(16, config.sliding_window - 1 + 4) - min(
@@ -206,5 +206,9 @@ def test_fused_placement_includes_sliding_append_capacity(exported):
     )
     with pytest.raises(ValueError, match="invalid placement"):
         placement_plan(
-            exported, ["cpu"], max_context=65537, optimized=True, flash_attention=True
+            exported,
+            ["cpu"],
+            max_context=65537,
+            optimized=False,
+            bounded_attention=True,
         )

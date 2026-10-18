@@ -1,4 +1,4 @@
-"""Bounded 310P fused GQA with in-place FP16 KV appends and causal chunking."""
+"""Bounded grouped attention with in-place FP16 KV appends and causal chunking."""
 
 from dataclasses import dataclass
 import torch
@@ -12,7 +12,7 @@ class AppendCache:
     length: int = 0
 
 
-def flash_attention(
+def bounded_attention(
     q,
     k,
     v,
@@ -24,7 +24,7 @@ def flash_attention(
     prefill_chunk=64,
     op=None,
 ):
-    """Process at most 32 GQA query rows per call, as required by 300I Duo.
+    """Bound grouped attention scores to at most 32 rows per KV head.
 
     Full-attention storage is allocated once per request, then appended in place.
     actual_seq_lengths excludes uninitialized capacity. Sliding caches retain
@@ -37,7 +37,7 @@ def flash_attention(
         or q.shape[0] != 1
         or k.shape[0] != 1
     ):
-        raise ValueError("fused attention requires single-sequence BNSD tensors")
+        raise ValueError("bounded attention requires single-sequence BNSD tensors")
     count, heads, kv_heads, dim = q.shape[-2], q.shape[1], k.shape[1], q.shape[-1]
     if (
         count < 1
@@ -46,15 +46,14 @@ def flash_attention(
         or heads % kv_heads
         or dim > 128
     ):
-        raise ValueError("unsupported fused attention geometry")
-    if start < 0 or start + count > max_context or max_context > 65536:
-        raise ValueError("fused attention context exceeded")
+        raise ValueError("unsupported bounded attention geometry")
+    if start < 0 or start + count > max_context:
+        raise ValueError("bounded attention context exceeded")
     if window is not None and window < 1:
         raise ValueError("invalid sliding window")
+    use_grouped = op is None
     if op is None:
-        import torch_npu
-
-        op = torch_npu.npu_incre_flash_attention
+        op = grouped_attention
     previous = 0
     if cache is not None:
         if cache.seen != start:
@@ -79,11 +78,15 @@ def flash_attention(
     else:
         length = count
         key, value = k.contiguous(), v.contiguous()
-    # No Hq/Hkv replication and no materialized Hq*Q*K score/softmax tensors.
+    # Copy each valid KV prefix at most once, without Hq/Hkv replication.
+    # Score/softmax memory is bounded by the small query subchunk.
+    if use_grouped:
+        key = key[:, :, :length].contiguous()
+        value = value[:, :, :length].contiguous()
     repeats = heads // kv_heads
     query_chunk = min(16, 32 // repeats)
     if query_chunk < 1:
-        raise ValueError("GQA ratio exceeds the 310P fused-kernel limit")
+        raise ValueError("GQA ratio exceeds the bounded score budget")
     outputs = []
     key_positions = torch.arange(key.shape[-2], device=q.device) + start - previous
     for first in range(0, count, query_chunk):
@@ -119,3 +122,32 @@ def flash_attention(
         cache.length = keep
         cache.seen = start + count
     return torch.cat(outputs, dim=-2)
+
+
+def grouped_attention(
+    query,
+    key,
+    value,
+    *,
+    atten_mask,
+    actual_seq_lengths,
+    num_heads,
+    num_key_value_heads,
+    scale_value,
+    **_,
+):
+    """Evaluate GQA without repeated KV heads or vendor fused-attention kernels."""
+    length = actual_seq_lengths[0]
+    count, dim = query.shape[-2:]
+    grouped = query.reshape(1, num_key_value_heads, -1, dim)
+    scores = (grouped @ key[:, :, :length].transpose(-1, -2)).reshape(
+        1, num_heads, count, length
+    ) * scale_value
+    probabilities = torch.softmax(
+        scores.masked_fill(atten_mask[..., :length], torch.finfo(query.dtype).min),
+        dim=-1,
+        dtype=torch.float32,
+    ).to(query.dtype)
+    return (
+        probabilities.reshape(1, num_key_value_heads, -1, length) @ value[:, :, :length]
+    ).reshape_as(query)
