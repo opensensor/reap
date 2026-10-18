@@ -8,7 +8,9 @@ import torch
 from safetensors import safe_open
 from safetensors.torch import load_file, save_file
 
-pytest.importorskip("msmodelslim")
+# ModelSlim patches Pydantic globally; defer importing it until quantization.
+if importlib.util.find_spec("msmodelslim") is None:
+    pytest.skip("requires ModelSlim", allow_module_level=True)
 if importlib.util.find_spec("transformers.models.muse_spark") is None:
     pytest.skip("requires native Muse", allow_module_level=True)
 

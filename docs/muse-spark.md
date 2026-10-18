@@ -3,8 +3,9 @@
 This implementation collects pruning statistics from unquantized eager Muse MoEs,
 slices retained experts in memory, and streams text calibration from indexed
 safetensors on CPU. It also exports a frozen pruning plan through ModelSlim into
-a custom W4-expert/W8-attention deployment format. The serving adapter remains
-separate work; the exported checkpoint cannot be loaded by stock vLLM.
+a custom W4-expert/W8-attention deployment format. An initial standalone text
+runtime supports sequential layer placement and greedy HTTP serving. Full-size
+generation remains unvalidated; stock vLLM cannot load this custom checkpoint.
 
 ## Implemented
 
@@ -92,7 +93,7 @@ The streaming runner deliberately uses native Muse classes and native mask/RoPE
 builders from the compatible environment.
 
 Merging metrics, quantized source checkpoints, adaptive per-layer expert counts,
-full-model generation quality, and a complete Ascend serving runtime
+full-model generation quality, and vLLM/distributed TP/EP integration
 are not supported by this change. Registering the model attributes does not
 establish support for other REAP merging/conversion paths.
 
@@ -326,8 +327,11 @@ The deployment candidate is contribution-weighted pruning with 128 retained
 experts per layer (top-8 routing unchanged), selected from the coding pilot. The
 next acceptance milestone is a generated response on six Ascend 310P chips,
 followed by an HTTP endpoint and executable coding smoke checks. The intended
-layout is TP2/PP3/EP2; memory capacity and numerical parity must be verified on
-the actual runtime before declaring this configuration usable.
+optimized layout is TP2/PP3/EP2. The first standalone runtime instead uses
+sequential complete-layer placement across six devices (PP6), with CPU transport
+at stage boundaries. Capacity and full-model behavior must be verified before
+declaring either configuration usable. The export's `runtime_required` note
+describes the original TP2/PP3/EP2 target, not a hard format restriction.
 
 `reap.muse_qualify prepare --export EXPORT --output PROBE` extracts three real
 quantized expert projections and CPU FP16 references. On the Ascend host,
@@ -340,3 +344,83 @@ adds launches and partial-product rounding; it is an initial bring-up path. The
 result records checksums and loaded simulator libraries. An existing Qwen extension may reject Muse dimensions: a successful
 import or simulator startup alone does not qualify the kernel. This probe tests
 same-quantized matrix multiplication, not end-to-end model quality.
+
+## Standalone Ascend runtime
+
+`reap.muse_runtime` loads the packed export without importing native Muse classes
+on the serving host. Its text equations are checked against the pinned native
+implementation, including the centered/input-scaled norms, FP32 router,
+selection-only bias, normalized expert outputs, gated residuals, output softcap,
+and per-layer RoPE/NoPE. A bounded sliding-window cache retains only the previous
+window minus one tokens; full-attention layers retain the complete prefix.
+Inputs are one contiguous unpadded text sequence. Prefill is chunked at 64 tokens
+by default, with a maximum chunk size of 128. Reset clears request caches.
+
+Resident expert weights remain packed W4. W8 attention uses a bounded fallback:
+dequantize 512 output rows to FP16, multiply, then release the temporary weights.
+The initial implementation prioritizes a verifiable path to generation; it has
+no fused MoE dispatch, sampling, continuous batching, TP/EP collectives, or
+performance claim. Complete layers are assigned to contiguous stages by a
+minimax planner that includes global weights, bounded KV storage, and a default
+3 GiB workspace reserve per device. Startup checks free memory before loading.
+It does not stop existing services to obtain that memory.
+
+Inspect the full export's placement without loading its weights:
+
+```sh
+PYTHONPATH=src python -m reap.muse_runtime --model /models/Muse-Spark-Contribution128-W4A16-W8Attn \
+  --devices npu:0 npu:1 npu:2 npu:3 npu:4 npu:5 --plan-only
+```
+
+On a host with the validated Torch/NPU and custom operator build, source CANN's
+`set_env.sh`, set `ASCEND_CUSTOM_OPP_PATH` to the operator vendor directory, and
+prepend its `op_api/lib` to `LD_LIBRARY_PATH`. Preserve CANN's existing
+`PYTHONPATH` when adding REAP's `src`. Then launch:
+
+```sh
+python -m reap.muse_serve --model /models/Muse-Spark-Contribution128-W4A16-W8Attn \
+  --devices npu:0 npu:1 npu:2 npu:3 npu:4 npu:5 \
+  --library /path/to/validated/vllm_ascend_C.so \
+  --max-context 8192 --prefill-chunk 64 --host 127.0.0.1 --port 8002
+```
+
+The tested host environment uses Torch 2.13.0, torch_npu 2.13.0.rc1, CANN 9.1.0,
+Transformers 5.17.0 for tokenization, FastAPI 0.136.3, and Uvicorn 0.53.0. The
+runtime does not require ModelSlim to be installed. Quantization and serving
+should run in separate processes: importing ModelSlim patches Torch/Pydantic.
+
+The initial API provides `/health`, `/v1/models`, `/v1/completions`, and
+`/v1/chat/completions`. Requests use `temperature: 0`, `n: 1`, and no streaming.
+Chat accepts string content, uses the checkpoint's chat template with default
+`reasoning_effort: low`, and separates Muse's self/user channels into
+`reasoning_content` and `content`. Tools, multimodal content, sampling, and other
+unsupported request fields are rejected. One request runs at a time; a busy
+runtime returns HTTP 503. Health becomes available only after weights load.
+
+Validation so far:
+
+- A small exported native model matches dequantized native full forwards,
+  cached decoding beyond the sliding window, and greedy generation/reset.
+- A complete real exported layer, including W8 attention and W4 MoE, passed
+  physical 310P forwards for an 11-token coding input both together and token
+  by token. Maximum absolute error versus native CPU was 0.0078125 and RMSE
+  about 0.000689 (tolerance `rtol=0.01, atol=0.005`). The CPU runtime matched
+  the native reference exactly for this input.
+- A separate **synthetic** six-layer model placed one layer on each of the six
+  physical chips, matched native CPU logits within tolerance, and generated the
+  same three greedy token IDs. Its HTTP completions and chat routes returned
+  successful responses. This is transport/API validation, not evidence of
+  full-size Muse generation or coding quality.
+
+`reap.muse_runtime_qualify prepare` builds the real first-layer native reference;
+`run` verifies full and cached execution on the host. Full-model quantized
+quality, real generation, actual resident memory, and throughput remain to be
+measured after the full export is staged and the six chips are available.
+
+`reap.muse_deploy` can supervise the remaining deployment without stopping another
+service. It waits for the transfer's `transfer-verified.json`, checks all six
+NPUs against the placement budget, launches the server, verifies that health
+belongs to its child process, and captures a nonempty 16-token coding completion.
+Only then does its atomic status change to `serving`. It records loading/failure
+states and server logs, and terminates only its own child if the launch or smoke
+fails. This final smoke establishes generation availability, not coding quality.
