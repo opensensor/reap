@@ -90,3 +90,29 @@ def test_local_control_auth_and_failure_blocks_inference():
         == 503
     )
     assert local.post("/resident/switch", json={}, headers=headers).status_code == 400
+
+
+def test_native_preflight_and_partial_failure(monkeypatch):
+    import reap.muse_resident as module
+
+    r = Resident(runtime())
+    manifest = {"name": "candidate", "namespace": "muse_w4_failure_test", "library": {}}
+
+    def invalid(_):
+        raise ValueError("bad hash")
+
+    monkeypatch.setattr(module, "check_manifest", invalid)
+    with pytest.raises(ValueError, match="bad hash"):
+        r.load_native(manifest)
+    assert r.failed is None and not r.loaded
+    monkeypatch.setattr(module, "check_manifest", lambda _: "digest")
+
+    def fails(*args):
+        raise RuntimeError("partial native registration")
+
+    monkeypatch.setattr(module, "NativeW4", fails)
+    with pytest.raises(RuntimeError, match="partial native"):
+        r.load_native(manifest)
+    assert r.failed and not r.loaded
+    with pytest.raises(RuntimeError, match="restart required"):
+        r.switch()

@@ -244,11 +244,20 @@ def main():
     parser.add_argument("--bounded-attention", action="store_true")
     parser.add_argument("--packed-cache", type=Path)
     parser.add_argument("--resident-token-file", type=Path)
+    parser.add_argument("--native-manifest", type=Path)
     args = parser.parse_args()
     if args.bounded_attention and (not args.optimized or args.max_context < 1):
         parser.error("--bounded-attention requires --optimized and positive context")
     if args.resident_token_file and not args.optimized:
         parser.error("resident controls require --optimized")
+    native_manifest = None
+    if args.native_manifest:
+        if not args.resident_token_file:
+            parser.error("--native-manifest requires --resident-token-file")
+        from reap.muse_native import check_manifest
+
+        native_manifest = json.loads(args.native_manifest.read_text())
+        check_manifest(native_manifest)
     token = None
     if args.resident_token_file:
         token = args.resident_token_file.read_text().strip()
@@ -288,6 +297,12 @@ def main():
         from reap.muse_resident import Resident
 
         resident = Resident(runtime)
+        if native_manifest:
+            resident.load_native(native_manifest)
+            receipt = resident.switch(native=native_manifest["name"])
+            print(
+                json.dumps({"event": "startup_native_activated", **receipt}), flush=True
+            )
     config = uvicorn.Config(
         create_app(
             runtime,

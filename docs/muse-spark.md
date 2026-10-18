@@ -747,3 +747,14 @@ this variation: all baseline/native comparisons were exact at 1, 7, 128 and 512
 tokens, with no material timing penalty in that test. Native-1024 MoE medians
 were 14.46 vs 17.82 ms at one token and 289.74 vs 335.21 ms at 512 tokens. These
 are isolated real-layer results, not full-model throughput claims.
+
+After qualification, `--native-manifest /absolute/path/manifest.json` restores the
+selected native module on future startups. It requires resident controls and
+runs the same per-device and full-logit gates before opening the listeners.
+The server fails startup if qualification fails. Keep a launcher without this
+flag for baseline recovery.
+
+The repeatable real-layer gate is `scripts/qualify_muse_native.py`; pass the
+model, native manifest, original operator library, device and output path. It
+checks every repeated result exactly under deterministic execution and reports
+synchronized medians separately for each prompt size.
