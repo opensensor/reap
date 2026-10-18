@@ -99,6 +99,13 @@ def run(args):
                 command.append("--optimized")
             if args.bounded_attention:
                 command.append("--bounded-attention")
+            for option in ("packed_cache", "resident_token_file"):
+                if getattr(args, option, None):
+                    command.extend(
+                        ["--" + option.replace("_", "-"), str(getattr(args, option))]
+                    )
+            for port in getattr(args, "additional_port", []):
+                command.extend(["--additional-port", str(port)])
             with (args.state_dir / "server.log").open("a") as log:
                 child = subprocess.Popen(
                     command,
@@ -186,8 +193,11 @@ def main():
     parser.add_argument("--max-context", type=int, default=8192)
     parser.add_argument("--prefill-chunk", type=int, default=64)
     parser.add_argument("--port", type=int, default=8002)
+    parser.add_argument("--additional-port", type=int, action="append", default=[])
     parser.add_argument("--optimized", action="store_true")
     parser.add_argument("--bounded-attention", action="store_true")
+    parser.add_argument("--packed-cache", type=Path)
+    parser.add_argument("--resident-token-file", type=Path)
     args = parser.parse_args()
     if args.bounded_attention and (not args.optimized or args.max_context < 1):
         parser.error("--bounded-attention requires --optimized and positive context")

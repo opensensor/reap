@@ -61,6 +61,7 @@ def pack_tiles(value, *, scales=False):
 class TiledBank:
     def __init__(self, parts, inputs, outputs):
         self.parts, self.inputs, self.outputs = parts, inputs, outputs
+        self.backend = None
 
     @classmethod
     def from_weights(cls, weights, experts, projections, device):
@@ -104,7 +105,11 @@ class TiledBank:
             parts.append((q, s, offset))
         return cls(parts, inputs, outputs)
 
-    def linear(self, x, *, expert=None, ids=None):
+    def linear(self, x, *, expert=None, ids=None, ends=None):
+        if self.backend is not None and expert is None:
+            return self.backend.linear(self, x, ids=ids, ends=ends)
+        if ends is not None:
+            raise ValueError("grouped routes require a native backend")
         if (expert is None) == (ids is None):
             raise ValueError("specify an expert or routed IDs")
         if x.ndim != 2 or x.shape[1] != self.inputs:
@@ -278,16 +283,23 @@ class FastMuseLayer(MuseLayer):
             )
             rows = (permutation // c.num_experts_per_tok).to(x.device)
             routes = latent[rows]
-            outputs = []
-            first = 0
-            for expert, count in zip(experts.tolist(), counts.tolist()):
-                gate, up = self.gate_up.linear(
-                    routes[first : first + count], expert=expert
-                ).chunk(2, dim=-1)
-                outputs.append(self.down.linear(F.silu(gate) * up, expert=expert))
-                first += count
+            if self.gate_up.backend is not None:
+                ends = host_ids.bincount(minlength=c.num_local_experts).cumsum(0)
+                ends = ends.to(x.device)
+                gate, up = self.gate_up.linear(routes, ends=ends).chunk(2, dim=-1)
+                projected = self.down.linear(F.silu(gate) * up, ends=ends)
+            else:
+                outputs = []
+                first = 0
+                for expert, count in zip(experts.tolist(), counts.tolist()):
+                    gate, up = self.gate_up.linear(
+                        routes[first : first + count], expert=expert
+                    ).chunk(2, dim=-1)
+                    outputs.append(self.down.linear(F.silu(gate) * up, expert=expert))
+                    first += count
+                projected = torch.cat(outputs)
             down = self.norm(
-                "mlp.experts.post_expert_norm", torch.cat(outputs), input_scaled=True
+                "mlp.experts.post_expert_norm", projected, input_scaled=True
             )
             # Restore token-major, ascending-expert order before the FP16 sum.
             ordered = torch.empty_like(down)
@@ -342,8 +354,16 @@ def native_weight(value, device):
     return value
 
 
-def load_fast_layer(root, index, config, device, *, journal=None, verify=True):
+def load_fast_layer(
+    root, index, config, device, *, journal=None, verify=True, packed_cache=None
+):
     """Convert on CPU, then transfer once; never retain duplicate NPU banks."""
+    if packed_cache is not None:
+        from reap.muse_packed import load_cached_layer
+
+        return load_cached_layer(
+            root, index, config, device, packed_cache, journal=journal, verify=verify
+        )
     original = load_layer(root, index, config, "cpu", journal=journal, verify=verify)
     values = original.w
     gate_up = TiledBank.from_weights(

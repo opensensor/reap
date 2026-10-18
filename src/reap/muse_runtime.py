@@ -431,6 +431,7 @@ class MuseRuntime:
         progress=print,
         optimized=False,
         bounded_attention=False,
+        packed_cache=None,
     ):
         self.root = Path(root)
         self.progress = progress
@@ -456,6 +457,8 @@ class MuseRuntime:
             raise ValueError("invalid context or prefill size")
         self.max_context, self.prefill_chunk = max_context, prefill_chunk
         self.optimized = optimized
+        if packed_cache is not None and not optimized:
+            raise ValueError("packed cache requires optimized mode")
         self.bounded_attention = bounded_attention
         if bounded_attention and not optimized:
             raise ValueError("bounded attention requires optimized mode")
@@ -507,6 +510,7 @@ class MuseRuntime:
                         item["device"],
                         journal=self.journal,
                         verify=verify,
+                        **({"packed_cache": packed_cache} if optimized else {}),
                     )
                 )
                 self.layers[-1].max_context = max_context

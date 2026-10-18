@@ -12,8 +12,11 @@ import re
 import threading
 import time
 import uuid
+import secrets
+import ipaddress
+import socket
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request as HTTPRequest
 from pydantic import BaseModel, ConfigDict, Field
 
 
@@ -55,15 +58,23 @@ def parse_response(text):
 
 
 def create_app(
-    runtime, tokenizer, *, eos, model_name="Muse-Spark-Contribution128-W4A16-W8Attn"
+    runtime,
+    tokenizer,
+    *,
+    eos,
+    model_name="Muse-Spark-Contribution128-W4A16-W8Attn",
+    resident=None,
+    resident_token=None,
 ):
     app = FastAPI(title="Muse Ascend bring-up")
     lock = threading.Lock()
+    if resident is not None and (not resident_token or len(resident_token) < 32):
+        raise ValueError("resident controls require a secret of at least 32 characters")
 
     @app.get("/health")
     def health():
         return {
-            "status": "ready",
+            "status": "blocked" if resident and resident.failed else "ready",
             "pid": os.getpid(),
             "model": model_name,
             "max_context": runtime.max_context,
@@ -71,7 +82,46 @@ def create_app(
             "optimized": getattr(runtime, "optimized", False),
             "bounded_attention": getattr(runtime, "bounded_attention", False),
             "prefill_chunk": getattr(runtime, "prefill_chunk", None),
+            "resident": resident.status() if resident else None,
         }
+
+    if resident is not None:
+
+        def authorize(request):
+            try:
+                local = ipaddress.ip_address(request.client.host).is_loopback
+            except (ValueError, AttributeError):
+                local = False
+            if not local or not secrets.compare_digest(
+                request.headers.get("authorization", ""), "Bearer " + resident_token
+            ):
+                raise HTTPException(
+                    403, "resident controls require local authentication"
+                )
+
+        @app.get("/resident/status")
+        def resident_status(request: HTTPRequest):
+            authorize(request)
+            return resident.status()
+
+        @app.post("/resident/{action}")
+        def resident_action(action: str, body: dict, request: HTTPRequest):
+            authorize(request)
+            if action not in ("load-native", "switch"):
+                raise HTTPException(404, "unknown resident action")
+            if not lock.acquire(blocking=False):
+                raise HTTPException(503, "runtime is handling another request")
+            try:
+                if action == "load-native":
+                    return resident.load_native(body)
+                if set(body) - {"native", "source"}:
+                    raise ValueError("unknown switch fields")
+                return resident.switch(**body)
+            except Exception as exc:
+                raise HTTPException(400, str(exc)) from exc
+            finally:
+                runtime.reset()
+                lock.release()
 
     @app.get("/v1/models")
     def models():
@@ -127,6 +177,8 @@ def create_app(
         if not lock.acquire(blocking=False):
             raise HTTPException(503, "runtime is handling another request")
         try:
+            if resident and resident.failed:
+                raise HTTPException(503, "resident controls blocked; restart required")
             tokens = runtime.generate(ids, limit, eos=eos)
         finally:
             # Caches contain request-specific state; release after success or failure.
@@ -184,9 +236,12 @@ def main():
     parser.add_argument("--reserve-gib", type=float, default=3)
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8002)
+    parser.add_argument("--additional-port", type=int, action="append", default=[])
     parser.add_argument("--served-model-name")
     parser.add_argument("--optimized", action="store_true")
     parser.add_argument("--bounded-attention", action="store_true")
+    parser.add_argument("--packed-cache", type=Path)
+    parser.add_argument("--resident-token-file", type=Path)
     args = parser.parse_args()
     if args.bounded_attention and (not args.optimized or args.max_context < 1):
         parser.error("--bounded-attention requires --optimized and positive context")
@@ -212,19 +267,47 @@ def main():
         reserve_gib=args.reserve_gib,
         optimized=args.optimized,
         bounded_attention=args.bounded_attention,
+        packed_cache=args.packed_cache,
     )
     torch.set_num_threads(2)
-    uvicorn.run(
+    resident = token = None
+    if args.resident_token_file:
+        from reap.muse_resident import Resident
+
+        token = args.resident_token_file.read_text().strip()
+        if args.resident_token_file.stat().st_mode & 0o077 or len(token) < 32:
+            parser.error(
+                "resident token file must be private and contain a 32+ character secret"
+            )
+        resident = Resident(runtime)
+    config = uvicorn.Config(
         create_app(
             runtime,
             tokenizer,
             eos=eos,
             model_name=args.served_model_name or args.model.name,
+            resident=resident,
+            resident_token=token,
         ),
         host=args.host,
         port=args.port,
         workers=1,
+        proxy_headers=False,
     )
+    # Both listeners share one process, model allocation and inference lock.
+    # Keep the existing endpoint while introducing a new primary port.
+    sockets = []
+    try:
+        for port in dict.fromkeys([args.port, *args.additional_port]):
+            listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sockets.append(listener)
+            listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            listener.bind((args.host, port))
+            listener.listen(2048)
+        uvicorn.Server(config).run(sockets=sockets)
+    finally:
+        for listener in sockets:
+            listener.close()
 
 
 if __name__ == "__main__":

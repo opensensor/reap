@@ -647,3 +647,95 @@ model plus accepted/rejected-cache handling. This deployment retains W4A16 and
 sequential layer placement. Cross-request batching and TP/EP execution require
 a separate scheduler and distributed model adapter; they are not enabled by
 increasing the prefill chunk.
+
+### Resident experiments and packed weight loading
+
+The optimized single-process server supports authenticated local controls for
+switching Python functions and versioned native W4 modules while all six stages
+keep their weights allocated. Enable `--resident-token-file /private/token` with
+a mode-0600 file containing a random secret of at least 32 characters. Controls
+require both a loopback TCP peer and the bearer secret; forwarded headers are
+not trusted. Inference continues to use the same single-request lock. A busy
+runtime returns 503 to a control request, so the client can retry after inference
+finishes. There is no background scheduler or graph capture to drain.
+
+Use `--port 8001 --additional-port 8002` to serve both listeners from the same
+process, model and request lock. Additional ports do not create extra replicas
+or increase concurrency.
+
+```bash
+python scripts/muse_resident_control.py --token-file /private/token status
+python scripts/muse_resident_control.py --token-file /private/token \
+  load-native /absolute/path/manifest.json
+python scripts/muse_resident_control.py --token-file /private/token \
+  switch --native muse_w4_v2_k1024
+# Restore original Python and the original W4 backend:
+python scripts/muse_resident_control.py --token-file /private/token switch
+```
+
+Native loading checks the library and kernel SHA256 before mutation, rejects
+namespace/name collisions, prepares a kernel on each stage, and compares actual
+resident gate/up weights against the installed operators for decode and grouped
+prefill, including empty expert groups and more than 128 rows. Loading leaves
+serving dispatch unchanged. A failure after native mutation blocks inference
+until restart; device code and Torch registrations cannot safely be unloaded.
+An identical successful manifest can be loaded again without re-registration.
+
+A dispatch switch compares complete logits for a four-token prefill and a cached
+one-token decode, requiring exact equality, unchanged weight storage addresses,
+and device synchronization. Failure restores the prior functions/backend and
+rechecks its logits before allowing requests. These are small transactional
+checks, not a substitute for a full coding or long-context evaluation. Health
+reports the PID, active module, generation and weight-storage digest. Native
+modules stay loaded until process exit even after dispatch rollback.
+
+A trusted Python candidate defines `replacements()` returning a dictionary from
+an allowed `module:Class.method` name to a callable. Pass it with `switch
+--candidate candidate.py` and repeat `--native NAME` to retain a native backend.
+Omitting either option restores that component to its startup implementation.
+Allowed functions are listed in `reap.muse_resident.TARGETS`; initially they cover
+MoE, RMS, attention inputs/outputs and tiled expert dispatch. Candidates must
+only define functions: no tensor mutation, model construction or device-state
+changes during import or `replacements()`. This is trusted development code,
+not a sandbox. Weight layouts, model construction and attention cache allocation
+still require a restart.
+
+Build an independently named direct-launch module on the target CANN/Torch
+installation after sourcing CANN's environment:
+
+```bash
+python scripts/muse_native/build.py \
+  --qwen-source /path/to/pinned/qwen-checkout \
+  --catlass-include /path/to/catlass/include \
+  --cann /usr/local/Ascend/cann-9.1.0 \
+  --output /new/absolute/build-directory --namespace muse_w4_v2 --tile 1024
+```
+
+The builder copies and fingerprints its actual external Qwen/Catlass inputs;
+upstream sources retain their licenses. Its bridge uses explicit ACLRTC device
+code, bypassing OPP discovery. The kernel reuses the existing resident W4 layout
+and FP16 split-K rounding; tile 1024 doubles the unpacking batch relative to the
+512 control. Grouped prefill processes sorted routes in one launch per split-K
+part instead of launching separately for each expert. Decode reuses the same
+interface with device route IDs. No activation or weight precision is reduced.
+
+For subsequent startups, enable `--packed-cache /path/to/cache`. Each layer is
+stored as safetensors with a SHA256 receipt, keyed by source shard receipts,
+config digest and packing ABI. It contains tiled W4 banks and dequantized dense
+FP16 matrices. Cache hits validate those bytes instead of rereading and repacking
+the source expert shards. Cache creation validates the canonical shards; corrupt
+cache entries fail closed. Files are written under a per-layer lock and published
+by atomic directory rename. The canonical model export is unchanged. NPUs still
+apply their dense NZ format during transfer. Explicit aligned host staging avoids
+slow driver transfers from large mmap views.
+
+The cache can be prepared on CPU while a previous model remains served:
+
+```bash
+TORCH_DEVICE_BACKEND_AUTOLOAD=0 python -m reap.muse_packed \
+  --model /path/to/export --cache /path/to/cache
+```
+
+The packed cache needs approximately another full checkpoint's disk capacity.
+The first build includes packing, writing and hashing costs; startup acceleration
+must be measured on cache hits. Hot switches do not read model weights from disk.
