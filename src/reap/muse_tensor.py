@@ -140,6 +140,12 @@ class TensorExperts:
     def prepare_graphs(self, inputs, routes):
         # Captures must be serial. All later invocations reuse static buffers;
         # changing token activations AND expert IDs are copied before replay.
+        if all(
+            (i, phase) in self.graphs
+            for i in range(len(self.ranks))
+            for phase in ("up", "down")
+        ):
+            return
         for i, rank in enumerate(self.ranks):
             with torch.npu.device(rank.device):
                 for phase in ("up", "down"):

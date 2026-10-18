@@ -124,6 +124,23 @@ def test_generation_matches_native_greedy_and_resets(exported):
     for _ in range(3):
         ids.append(int(logits(native, head, ids)[0, -1].argmax()))
     assert runtime.generate(prompt, 3) == ids[len(prompt) :]
+    emitted = []
+    assert (
+        runtime.generate(prompt, 3, on_token=emitted.append)
+        == emitted
+        == ids[len(prompt) :]
+    )
+    import threading
+
+    cancel = threading.Event()
+
+    def stop(token):
+        cancel.set()
+
+    with pytest.raises(InterruptedError):
+        runtime.generate(prompt, 3, on_token=stop, cancel=cancel)
+    runtime.reset()
+    assert runtime.seen == 0
     assert runtime.generate(prompt, 3) == ids[len(prompt) :]
     assert (
         runtime.generate(prompt, 3, eos=[ids[len(prompt)]])

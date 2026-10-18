@@ -642,7 +642,7 @@ class MuseRuntime:
         self.seen += len(ids)
         return logits
 
-    def generate(self, ids, max_new_tokens=32, eos=()):
+    def generate(self, ids, max_new_tokens=32, eos=(), *, on_token=None, cancel=None):
         if (
             not ids
             or max_new_tokens < 1
@@ -661,6 +661,8 @@ class MuseRuntime:
             )
         )
         for start in range(0, len(ids), self.prefill_chunk):
+            if cancel is not None and cancel.is_set():
+                raise InterruptedError("generation cancelled")
             logits = self.forward(ids[start : start + self.prefill_chunk])
             self.progress(
                 json.dumps(
@@ -674,8 +676,12 @@ class MuseRuntime:
         prefill_seconds = time.monotonic() - started
         result = []
         for step in range(max_new_tokens):
+            if cancel is not None and cancel.is_set():
+                raise InterruptedError("generation cancelled")
             token = int(logits[0, -1].argmax())
             result.append(token)
+            if on_token is not None:
+                on_token(token)
             if len(result) % 16 == 0:
                 self.progress(
                     json.dumps(

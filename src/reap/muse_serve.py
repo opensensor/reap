@@ -1,10 +1,11 @@
 """Minimal single-request, greedy OpenAI-compatible Muse text endpoint.
 
-This initial server implements non-streaming completions and text chat. It uses
+This server implements streaming and non-streaming completions and text chat. It uses
 the exported tokenizer/chat template and does not claim tool or vision support.
 """
 
 import argparse
+import asyncio
 import json
 import os
 from pathlib import Path
@@ -17,13 +18,34 @@ import ipaddress
 import socket
 
 from fastapi import FastAPI, HTTPException, Request as HTTPRequest
-from pydantic import BaseModel, ConfigDict, Field
+from fastapi.responses import StreamingResponse
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 class Message(BaseModel):
     model_config = ConfigDict(extra="forbid")
     role: str
     content: str
+    reasoning_content: str | None = None
+
+    @field_validator("content", mode="before")
+    @classmethod
+    def text_parts(cls, value):
+        if isinstance(value, list):
+            if any(
+                not isinstance(p, dict)
+                or p.get("type") != "text"
+                or not isinstance(p.get("text"), str)
+                for p in value
+            ):
+                raise ValueError("only text content is supported")
+            return "".join(p["text"] for p in value)
+        return value
+
+
+class StreamOptions(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    include_usage: bool = False
 
 
 class Request(BaseModel):
@@ -37,6 +59,7 @@ class Request(BaseModel):
     top_p: float = 1
     n: int = 1
     stream: bool = False
+    stream_options: StreamOptions | None = None
     reasoning_effort: str = "low"
 
 
@@ -55,6 +78,138 @@ def parse_response(text):
         "content": content,
         **({"reasoning_content": reasoning} if reasoning else {}),
     }
+
+
+def visible_stream_text(tokenizer, tokens, chat, final=False):
+    text = tokenizer.decode(
+        tokens, skip_special_tokens=not chat, clean_up_tokenization_spaces=False
+    )
+    if not final:
+        # A byte-level tokenizer can temporarily decode an incomplete Unicode
+        # character. Muse's channel delimiters must also remain out of deltas.
+        text = text.rstrip("\ufffd")
+        if chat:
+            for marker in ("<|start|>", "<|eom|>", "<|eot|>", "<|end_of_text|>"):
+                for size in range(min(len(marker) - 1, len(text)), 0, -1):
+                    if text.endswith(marker[:size]):
+                        text = text[:-size]
+                        break
+    return parse_response(text) if chat else {"text": text}
+
+
+def streaming_response(
+    runtime, tokenizer, ids, limit, eos, chat, model_name, lock, *, include_usage=False
+):
+    """Keep one device worker and request lock until completion or cancellation."""
+    stopped = threading.Event()
+
+    async def events():
+        loop = asyncio.get_running_loop()
+        queue = asyncio.Queue()
+
+        def send(kind, value):
+            if not stopped.is_set():
+                try:
+                    loop.call_soon_threadsafe(queue.put_nowait, (kind, value))
+                except RuntimeError:
+                    stopped.set()
+
+        def produce():
+            result = None
+            try:
+                tokens = runtime.generate(
+                    ids,
+                    limit,
+                    eos=eos,
+                    on_token=lambda t: send("token", t),
+                    cancel=stopped,
+                )
+                result = ("done", tokens)
+            except InterruptedError:
+                pass
+            except Exception as exc:
+                result = ("error", str(exc))
+            finally:
+                try:
+                    runtime.reset()
+                finally:
+                    lock.release()
+            if result is not None:
+                send(*result)
+
+        base = {
+            "id": ("chatcmpl-" if chat else "cmpl-") + uuid.uuid4().hex,
+            "object": "chat.completion.chunk" if chat else "text_completion",
+            "created": int(time.time()),
+            "model": model_name,
+        }
+
+        def frame(value):
+            return "data: " + json.dumps(value) + "\n\n"
+
+        def chunk(delta, finish=None):
+            choice = {"index": 0, "finish_reason": finish}
+            choice.update(
+                {"delta": delta}
+                if chat
+                else {"text": delta.get("text", ""), "logprobs": None}
+            )
+            return {**base, "choices": [choice]}
+
+        worker = threading.Thread(target=produce, name="muse-generation", daemon=True)
+        worker.start()
+        tokens, emitted = [], {}
+        try:
+            if chat:
+                yield frame(chunk({"role": "assistant"}))
+            while True:
+                kind, value = await queue.get()
+                if kind == "error":
+                    yield frame(
+                        {"error": {"message": value, "type": "generation_error"}}
+                    )
+                    return
+                if kind == "token":
+                    tokens.append(value)
+                visible = visible_stream_text(
+                    tokenizer, tokens, chat, final=kind == "done"
+                )
+                delta = {}
+                for key in ("content", "reasoning_content") if chat else ("text",):
+                    text = visible.get(key, "")
+                    previous = emitted.get(key, "")
+                    if not text.startswith(previous):
+                        raise RuntimeError("tokenizer revised already streamed text")
+                    if len(text) > len(previous):
+                        delta[key] = text[len(previous) :]
+                    emitted[key] = text
+                if delta:
+                    yield frame(chunk(delta))
+                if kind == "done":
+                    finish = "stop" if tokens and tokens[-1] in eos else "length"
+                    yield frame(chunk({}, finish))
+                    if include_usage:
+                        yield frame(
+                            {
+                                **base,
+                                "choices": [],
+                                "usage": {
+                                    "prompt_tokens": len(ids),
+                                    "completion_tokens": len(tokens),
+                                    "total_tokens": len(ids) + len(tokens),
+                                },
+                            }
+                        )
+                    yield "data: [DONE]\n\n"
+                    return
+        finally:
+            stopped.set()
+
+    return StreamingResponse(
+        events(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
 
 def create_app(
@@ -87,6 +242,7 @@ def create_app(
             "bounded_attention": getattr(runtime, "bounded_attention", False),
             "prefill_chunk": getattr(runtime, "prefill_chunk", None),
             "deterministic": getattr(runtime, "deterministic", False),
+            "streaming": True,
             "resident": resident.status() if resident else None,
         }
 
@@ -140,15 +296,10 @@ def create_app(
     def complete(request, chat):
         if request.model not in (None, model_name):
             raise HTTPException(404, "unknown model")
-        if (
-            request.stream
-            or request.n != 1
-            or request.temperature != 0
-            or request.top_p != 1
-        ):
+        if request.n != 1 or request.temperature != 0 or request.top_p != 1:
             raise HTTPException(
                 400,
-                "initial runtime supports non-streaming greedy generation with n=1, temperature=0, top_p=1",
+                "runtime supports greedy generation with n=1, temperature=0, top_p=1",
             )
         if request.reasoning_effort not in ("low", "medium", "high", "xhigh"):
             raise HTTPException(400, "invalid reasoning_effort")
@@ -162,7 +313,10 @@ def create_app(
                 raise HTTPException(400, "unsupported message role")
             try:
                 ids = tokenizer.apply_chat_template(
-                    [m.model_dump() for m in request.messages],
+                    [
+                        m.model_dump(exclude={"reasoning_content"})
+                        for m in request.messages
+                    ],
                     tokenize=True,
                     add_generation_prompt=True,
                     return_dict=False,
@@ -181,22 +335,45 @@ def create_app(
             )
         if not lock.acquire(blocking=False):
             raise HTTPException(503, "runtime is handling another request")
+        if resident and resident.failed:
+            lock.release()
+            raise HTTPException(503, "resident controls blocked; restart required")
+        if request.stream:
+            return streaming_response(
+                runtime,
+                tokenizer,
+                ids,
+                limit,
+                eos,
+                chat,
+                model_name,
+                lock,
+                include_usage=bool(
+                    request.stream_options and request.stream_options.include_usage
+                ),
+            )
         try:
-            if resident and resident.failed:
-                raise HTTPException(503, "resident controls blocked; restart required")
             tokens = runtime.generate(ids, limit, eos=eos)
         finally:
             # Caches contain request-specific state; release after success or failure.
-            runtime.reset()
-            lock.release()
+            try:
+                runtime.reset()
+            finally:
+                lock.release()
         finish = "stop" if tokens and tokens[-1] in eos else "length"
         choice = {"index": 0, "finish_reason": finish}
         if chat:
             choice["message"] = parse_response(
-                tokenizer.decode(tokens, skip_special_tokens=False)
+                tokenizer.decode(
+                    tokens,
+                    skip_special_tokens=False,
+                    clean_up_tokenization_spaces=False,
+                )
             )
         else:
-            choice["text"] = tokenizer.decode(tokens, skip_special_tokens=True)
+            choice["text"] = tokenizer.decode(
+                tokens, skip_special_tokens=True, clean_up_tokenization_spaces=False
+            )
             choice["logprobs"] = None
         return {
             "id": ("chatcmpl-" if chat else "cmpl-") + uuid.uuid4().hex,
