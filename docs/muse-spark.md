@@ -1014,7 +1014,7 @@ resident model changes discard the prefix. Health reports `prefix_cache`, and
 generation logs report `cached_prompt_tokens`; cold throughput and reused-prefix
 latency must be reported separately.
 
-Runtime `ef5ef31` now serves both ports with prefix reuse enabled. All 358 frozen
+Runtime `ef5ef31` qualified both ports with prefix reuse enabled. All 358 frozen
 runtime files and 62 packed-cache layers verified. The placement plan includes
 the sliding snapshots and the existing 3 GiB reserve per device; it retains the
 98,304-token capacity, original graph patch and established native W4 backend.
@@ -1109,3 +1109,24 @@ requests also return 400. This compatibility fix does not drop the client's tool
 definitions or change the Kilo configuration. Tests cover the reported ordinary
 chat request with tools, streamed calls, typed arguments, history round trips,
 and the existing disconnect/cache behavior.
+
+Runtime `2765412` serves ports 8001 and 8002 with the combined decode patch and
+function-tool compatibility. All 62 packed-cache layers loaded; the frozen image
+contains 360 verified files. The 127 focused tests pass. Live SSE completion/chat
+messages, reasoning, usage and finish reasons match the earlier reference exactly.
+Long-prompt cold prefill remains **31.892 tok/s**, with **1.993 decode tok/s** after
+2,127 prompt tokens. Reusing 2,048 prompt tokens reduces first text from **66.698
+to 2.892 seconds** and total response time from **74.222 to 10.479 seconds**, with
+identical output. These prefix gains remain separate from raw decode throughput.
+
+A live `what are you?` request with `tools` and `tool_choice: "auto"` returned a
+normal answer instead of 422. Another request emitted `lookup({"query":"abc"})`
+as an API tool call; a matching tool-result message produced a final answer
+containing the supplied result. These are interface smokes, not a broad tool-use
+quality evaluation. Additional benchmark requests were stopped to release the
+single-request worker for interactive use. The latest deployment did not repeat
+the hardware disconnect or complete the changed-suffix cold/warm comparison;
+CPU tests and the previous deployment's checks remain available. Evidence is in
+`tools-validation-summary.json`, `stream-validation-summary.json`,
+`pipeline-combined-performance.json` and `final-health.json` under
+`../results/muse-opt-v7`.
