@@ -246,6 +246,13 @@ class FastMuseLayer(MuseLayer):
         )
         return self.attention_output(attended, x)
 
+    def expert_projection(self, routes, *, ids=None, ends=None):
+        if hasattr(self, "tensor_experts"):
+            return self.tensor_experts.project(routes, ids=ids, ends=ends)
+        metadata = {"ends": ends} if ends is not None else {"ids": ids}
+        gate, up = self.gate_up.linear(routes, **metadata).chunk(2, dim=-1)
+        return self.down.linear(F.silu(gate) * up, **metadata)
+
     def moe(self, x):
         c = self.c
         flat = x.reshape(-1, x.shape[-1])
@@ -283,11 +290,10 @@ class FastMuseLayer(MuseLayer):
             )
             rows = (permutation // c.num_experts_per_tok).to(x.device)
             routes = latent[rows]
-            if self.gate_up.backend is not None:
+            if self.gate_up.backend is not None or hasattr(self, "tensor_experts"):
                 ends = host_ids.bincount(minlength=c.num_local_experts).cumsum(0)
                 ends = ends.to(x.device)
-                gate, up = self.gate_up.linear(routes, ends=ends).chunk(2, dim=-1)
-                projected = self.down.linear(F.silu(gate) * up, ends=ends)
+                projected = self.expert_projection(routes, ends=ends)
             else:
                 outputs = []
                 first = 0
@@ -324,8 +330,7 @@ class FastMuseLayer(MuseLayer):
                 .reshape(-1, current.shape[-1])
             )
             route_ids = ids[first : first + tokens_per_chunk].flatten().to(torch.int32)
-            gate, up = self.gate_up.linear(routes, ids=route_ids).chunk(2, dim=-1)
-            down = self.down.linear(F.silu(gate) * up, ids=route_ids)
+            down = self.expert_projection(routes, ids=route_ids)
             down = self.norm("mlp.experts.post_expert_norm", down, input_scaled=True)
             down = down.reshape(len(current), c.num_experts_per_tok, -1)
             contributions = (

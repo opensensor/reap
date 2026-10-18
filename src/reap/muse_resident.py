@@ -40,16 +40,17 @@ class Resident:
         if not runtime.optimized:
             raise ValueError("resident controls require optimized runtime")
         self.runtime = runtime
+        self.layers = getattr(runtime, "resident_layers", runtime.layers)
         self.loaded, self.namespaces = {}, {}
         self.active, self.python_digest, self.failed = None, None, None
         self.generation = 0
         self.originals = {name: getattr(*target(name)) for name in TARGETS}
-        self.devices = sorted({str(layer.device) for layer in runtime.layers})
+        self.devices = sorted({str(layer.device) for layer in self.layers})
         self.identity = self.storage_identity()
 
     def storage_identity(self):
         tensors = list(self.runtime.globals.items())
-        for i, layer in enumerate(self.runtime.layers):
+        for i, layer in enumerate(self.layers):
             tensors.extend((f"{i}.{name}", value) for name, value in layer.w.items())
             for name in ("gate_up", "down"):
                 for p, part in enumerate(getattr(layer, name).parts):
@@ -111,9 +112,7 @@ class Resident:
             # crossing the old 128-row limit, with empty expert groups.
             with torch.inference_mode():
                 for device in self.devices:
-                    layer = next(
-                        l for l in self.runtime.layers if str(l.device) == device
-                    )
+                    layer = next(l for l in self.layers if str(l.device) == device)
                     bank = layer.gate_up
                     for grouped in (False, True):
                         rows = 137 if grouped else 8
@@ -171,13 +170,18 @@ class Resident:
         finally:
             self.runtime.reset()
 
+    def invalidate_graphs(self):
+        invalidate = getattr(self.runtime, "invalidate_graphs", None)
+        if invalidate is not None:
+            invalidate()
+
     def switch(self, *, native=None, source=None):
         self.require_ready()
         if native is not None and native not in self.loaded:
             raise ValueError("native backend must be loaded and qualified first")
         code = compile(source, "<resident-candidate>", "exec") if source else None
         old = {name: getattr(*target(name)) for name in TARGETS}
-        old_backend = self.runtime.layers[0].gate_up.backend
+        old_backend = self.layers[0].gate_up.backend
         started = time.monotonic()
         reference = self.probe()
         try:
@@ -196,8 +200,9 @@ class Resident:
                 owner, attribute = target(name)
                 setattr(owner, attribute, replacements.get(name, original))
             backend = self.loaded[native][1] if native else None
-            for layer in self.runtime.layers:
+            for layer in self.layers:
                 layer.gate_up.backend = layer.down.backend = backend
+            self.invalidate_graphs()
             actual = self.probe()
             self.synchronize()
             if self.storage_identity() != self.identity:
@@ -208,9 +213,10 @@ class Resident:
             for name, function in old.items():
                 owner, attribute = target(name)
                 setattr(owner, attribute, function)
-            for layer in self.runtime.layers:
+            for layer in self.layers:
                 layer.gate_up.backend = layer.down.backend = old_backend
             try:
+                self.invalidate_graphs()
                 restored = self.probe()
                 self.synchronize()
                 if self.storage_identity() != self.identity:

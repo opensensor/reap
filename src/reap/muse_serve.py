@@ -78,7 +78,11 @@ def create_app(
             "pid": os.getpid(),
             "model": model_name,
             "max_context": runtime.max_context,
-            "execution": "sequential layer placement; greedy; single request",
+            "execution": getattr(
+                runtime,
+                "execution",
+                "sequential layer placement; greedy; single request",
+            ),
             "optimized": getattr(runtime, "optimized", False),
             "bounded_attention": getattr(runtime, "bounded_attention", False),
             "prefill_chunk": getattr(runtime, "prefill_chunk", None),
@@ -240,6 +244,7 @@ def main():
     parser.add_argument("--additional-port", type=int, action="append", default=[])
     parser.add_argument("--served-model-name")
     parser.add_argument("--optimized", action="store_true")
+    parser.add_argument("--tensor-experts", action="store_true")
     parser.add_argument("--deterministic", action="store_true")
     parser.add_argument("--bounded-attention", action="store_true")
     parser.add_argument("--packed-cache", type=Path)
@@ -289,8 +294,9 @@ def main():
         optimized=args.optimized,
         bounded_attention=args.bounded_attention,
         packed_cache=args.packed_cache,
+        tensor_experts=args.tensor_experts,
     )
-    torch.set_num_threads(2)
+    torch.set_num_threads(1 if args.tensor_experts else 2)
     runtime.deterministic = args.deterministic
     resident = None
     if args.resident_token_file:
@@ -331,6 +337,7 @@ def main():
     finally:
         for listener in sockets:
             listener.close()
+        runtime.close()
 
 
 if __name__ == "__main__":

@@ -64,6 +64,7 @@ def run(args):
                 optimized=args.optimized,
                 bounded_attention=args.bounded_attention,
                 prefill_chunk=args.prefill_chunk,
+                tensor_experts=getattr(args, "tensor_experts", False),
             )
             while True:
                 memory = []
@@ -97,6 +98,8 @@ def run(args):
             ]
             if getattr(args, "deterministic", False):
                 command.append("--deterministic")
+            if getattr(args, "tensor_experts", False):
+                command.append("--tensor-experts")
             if args.optimized:
                 command.append("--optimized")
             if args.bounded_attention:
@@ -197,6 +200,7 @@ def main():
     parser.add_argument("--port", type=int, default=8002)
     parser.add_argument("--additional-port", type=int, action="append", default=[])
     parser.add_argument("--optimized", action="store_true")
+    parser.add_argument("--tensor-experts", action="store_true")
     parser.add_argument("--deterministic", action="store_true")
     parser.add_argument("--bounded-attention", action="store_true")
     parser.add_argument("--packed-cache", type=Path)

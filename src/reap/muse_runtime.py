@@ -314,6 +314,7 @@ def placement_plan(
     optimized=False,
     bounded_attention=False,
     prefill_chunk=64,
+    tensor_experts=False,
 ):
     """Minimax contiguous layer placement, including globals and bounded KV."""
     root = Path(root)
@@ -406,7 +407,7 @@ def placement_plan(
             if candidates:
                 dp[stage + 1, end] = min(candidates, key=lambda item: item[0])
     ranges = dp[len(devices), n][1]
-    return [
+    stages = [
         {
             "device": device,
             "first_layer": begin,
@@ -416,6 +417,15 @@ def placement_plan(
         }
         for device, (begin, end, cost) in zip(devices, ranges)
     ]
+    if tensor_experts:
+        if not optimized or not bounded_attention or len(devices) < 2:
+            raise ValueError(
+                "tensor experts require optimized bounded attention and multiple devices"
+            )
+        from reap.muse_tensor import tensor_plan
+
+        return tensor_plan(c, journal, stages, max_context, prefill_chunk, reserve_gib)
+    return stages
 
 
 class MuseRuntime:
@@ -432,6 +442,7 @@ class MuseRuntime:
         optimized=False,
         bounded_attention=False,
         packed_cache=None,
+        tensor_experts=False,
     ):
         self.root = Path(root)
         self.progress = progress
@@ -457,6 +468,12 @@ class MuseRuntime:
             raise ValueError("invalid context or prefill size")
         self.max_context, self.prefill_chunk = max_context, prefill_chunk
         self.optimized = optimized
+        self.tensor_experts = tensor_experts
+        self.execution = (
+            "tensor-parallel experts; sequential dense stages"
+            if tensor_experts
+            else "sequential layer placement"
+        ) + "; greedy; single request"
         if packed_cache is not None and not optimized:
             raise ValueError("packed cache requires optimized mode")
         self.bounded_attention = bounded_attention
@@ -472,6 +489,7 @@ class MuseRuntime:
             optimized=optimized,
             bounded_attention=bounded_attention,
             prefill_chunk=prefill_chunk,
+            tensor_experts=tensor_experts,
         )
         loader = load_layer
         if optimized:
@@ -496,14 +514,34 @@ class MuseRuntime:
                         f"insufficient free memory on {device}: need {item['required_bytes'] / 2**30:.2f} GiB, free {free / 2**30:.2f} GiB"
                     )
         self.layers, self.globals = [], {}
+        self.resident_layers = []
+        if tensor_experts:
+            from reap.muse_tensor import make_pool
+
+            self.expert_pool = make_pool(devices)
         for item in self.plan:
             if optimized:
                 from reap.muse_fast import StepPositions
 
                 positions = StepPositions()
             for i in range(item["first_layer"], item["last_layer_exclusive"]):
-                self.layers.append(
-                    loader(
+                if tensor_experts:
+                    from reap.muse_tensor import shard_layer
+
+                    cpu = loader(
+                        root,
+                        i,
+                        self.c,
+                        "cpu",
+                        journal=self.journal,
+                        verify=verify,
+                        packed_cache=packed_cache,
+                    )
+                    layer = shard_layer(cpu, devices, item["device"], self.expert_pool)
+                    del cpu
+                    self.resident_layers.extend(layer.tensor_experts.ranks)
+                else:
+                    layer = loader(
                         root,
                         i,
                         self.c,
@@ -512,7 +550,8 @@ class MuseRuntime:
                         verify=verify,
                         **({"packed_cache": packed_cache} if optimized else {}),
                     )
-                )
+                    self.resident_layers.append(layer)
+                self.layers.append(layer)
                 self.layers[-1].max_context = max_context
                 self.layers[-1].prefill_chunk = prefill_chunk
                 self.layers[-1].bounded_attention = bounded_attention
@@ -541,6 +580,16 @@ class MuseRuntime:
                 else:
                     self.globals[name] = tensor.to(device)
         self.reset()
+
+    def close(self):
+        self.invalidate_graphs()
+        if hasattr(self, "expert_pool"):
+            self.expert_pool.shutdown(wait=True)
+
+    def invalidate_graphs(self):
+        for layer in self.layers:
+            if hasattr(layer, "tensor_experts"):
+                layer.tensor_experts.invalidate_graphs()
 
     def reset(self):
         if self.bounded_attention:
