@@ -170,3 +170,15 @@ def test_nonfinite_logits_fail_instead_of_generating(exported):
         runtime.forward([1, 4])
     runtime.reset()
     assert runtime.seen == 0 and all(cache.key is None for cache in runtime.cache)
+
+
+def test_optimized_placement_is_available_offline_and_accounts_for_weights(exported):
+    plain = placement_plan(exported, ["npu:0", "npu:1"], max_context=8, reserve_gib=0)
+    fast = placement_plan(
+        exported, ["npu:0", "npu:1"], max_context=8, reserve_gib=0, optimized=True
+    )
+    assert sum(x["required_bytes"] for x in fast) > sum(
+        x["required_bytes"] for x in plain
+    )
+    with pytest.raises(ValueError, match="only once"):
+        placement_plan(exported, ["npu:00", "npu:0"])

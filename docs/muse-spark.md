@@ -467,3 +467,28 @@ belongs to its child process, and captures a nonempty 16-token coding completion
 Only then does its atomic status change to `serving`. It records loading/failure
 states and server logs, and terminates only its own child if the launch or smoke
 fails. This final smoke establishes generation availability, not coding quality.
+
+
+## Optimized 310P execution
+
+Pass `--optimized` to `muse_serve`, `muse_runtime`, or `muse_deploy` to select the
+optimized execution path. The original path remains available for comparison.
+The on-disk export and quantization recipe are unchanged.
+
+At load time, expert banks are split along K and losslessly encoded into the
+installed operator's Cube tile layout. Gate and up projections share one bank.
+Decode routes experts on-device and preserves ascending-expert FP16 accumulation
+order; prefill groups tokens by expert on the host to reuse decoded tiles.
+The installed routed kernel was substantially slower for multi-token groups,
+so it is used only for single-token decoding.
+
+Attention weights are dequantized once to the same FP16 values used by the
+reference path. Dense FP16 matrices, including the output head, are explicitly
+stored in FRACTAL_NZ format; implicit format selection remains disabled for
+activations and packed custom operators. The placement budget includes the
+larger attention weights and retained tiled zero-point metadata. This uses more
+resident memory to eliminate repeated dequantization and format conversions.
+
+Generation logs now report prompt processing progress, output-token progress,
+and separate prefill/decode durations. A CPU-only host can calculate optimized
+NPU placement with `--plan-only --optimized`, without importing torch_npu.

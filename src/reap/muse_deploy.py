@@ -57,7 +57,9 @@ def run(args):
             from reap.muse_runtime import placement_plan
 
             torch_npu.npu.set_compile_mode(jit_compile=False)
-            plan = placement_plan(args.model, args.devices, args.max_context)
+            plan = placement_plan(
+                args.model, args.devices, args.max_context, optimized=args.optimized
+            )
             while True:
                 memory = []
                 for stage in plan:
@@ -88,6 +90,8 @@ def run(args):
                 "--port",
                 str(args.port),
             ]
+            if args.optimized:
+                command.append("--optimized")
             with (args.state_dir / "server.log").open("a") as log:
                 child = subprocess.Popen(
                     command,
@@ -175,6 +179,7 @@ def main():
     parser.add_argument("--max-context", type=int, default=8192)
     parser.add_argument("--prefill-chunk", type=int, default=64)
     parser.add_argument("--port", type=int, default=8002)
+    parser.add_argument("--optimized", action="store_true")
     args = parser.parse_args()
     if any(not device.startswith("npu:") for device in args.devices):
         parser.error("deployment supervisor requires explicit NPU devices")

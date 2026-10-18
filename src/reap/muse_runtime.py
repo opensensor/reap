@@ -11,6 +11,7 @@ import argparse
 from dataclasses import dataclass
 import hashlib
 import json
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -294,14 +295,22 @@ def load_layer(root, index, config, device, *, journal=None, verify=True):
     return MuseLayer(config, index, values)
 
 
-def placement_plan(root, devices, max_context=8192, reserve_gib=3):
+def placement_plan(root, devices, max_context=8192, reserve_gib=3, *, optimized=False):
     """Minimax contiguous layer placement, including globals and bounded KV."""
     root = Path(root)
     journal = json.loads((root / "export-progress.json").read_text())
     if not journal["complete"]:
         raise ValueError("full export must complete before planning resident execution")
     c = configuration(json.loads((root / "config.json").read_text()))
-    accelerated = [str(torch.device(d)) for d in devices if str(d) != "cpu"]
+
+    # Planning is also supported on CPU-only hosts without torch_npu registered.
+    def canonical(device):
+        value = str(device)
+        if value.startswith("npu:") and value[4:].isdigit():
+            return "npu:" + str(int(value[4:]))
+        return str(torch.device(device))
+
+    accelerated = [canonical(d) for d in devices if str(d) != "cpu"]
     if len(set(accelerated)) != len(accelerated):
         raise ValueError("each accelerator must appear only once in the stage plan")
     if (
@@ -321,6 +330,25 @@ def placement_plan(root, devices, max_context=8192, reserve_gib=3):
                 f"experts-{i:03d}-ep1.safetensors",
             )
         )
+        if optimized:
+            for filename in (
+                f"dense-{i:03d}.safetensors",
+                f"experts-{i:03d}-ep0.safetensors",
+                f"experts-{i:03d}-ep1.safetensors",
+            ):
+                tensors = journal["shards"][filename]["tensors"]
+                for name, receipt in tensors.items():
+                    if not name.endswith(".weight_scale"):
+                        continue
+                    if ".mlp.experts." in name:
+                        # Tiled kernels retain INT8 offsets alongside FP16 scales.
+                        weight += receipt["bytes"] // 2
+                    else:
+                        # W8 codes/scales are replaced by same-dequantized FP16.
+                        weight += (
+                            tensors[name.removesuffix("_scale")]["bytes"]
+                            - receipt["bytes"]
+                        )
         tokens = (
             min(max_context, c.sliding_window - 1)
             if c.layer_types[i] == "sliding_attention"
@@ -377,8 +405,11 @@ class MuseRuntime:
         reserve_gib=3,
         verify=True,
         progress=print,
+        optimized=False,
     ):
         self.root = Path(root)
+        self.progress = progress
+        self.generation_stats = {}
         self.journal = json.loads((self.root / "export-progress.json").read_text())
         index = json.loads((self.root / "model.safetensors.index.json").read_text())
         if not self.journal["complete"] or index["metadata"]["format"] != FORMAT:
@@ -399,7 +430,25 @@ class MuseRuntime:
         ):
             raise ValueError("invalid context or prefill size")
         self.max_context, self.prefill_chunk = max_context, prefill_chunk
-        self.plan = placement_plan(root, devices, max_context, reserve_gib)
+        self.optimized = optimized
+        if optimized and any(not str(d).startswith("npu:") for d in devices):
+            raise ValueError("optimized execution requires explicit NPU devices")
+        self.plan = placement_plan(
+            root, devices, max_context, reserve_gib, optimized=optimized
+        )
+        loader = load_layer
+        if optimized:
+            from reap.muse_fast import load_fast_layer
+
+            loader = load_fast_layer
+            for name in (
+                "npu_qwen_w4_group_matmul_310",
+                "npu_qwen_w4_routed_matmul_310",
+            ):
+                if not hasattr(torch.ops._C_ascend, name):
+                    raise RuntimeError(
+                        f"optimized execution requires custom operator {name}"
+                    )
         for item in self.plan:
             device = torch.device(item["device"])
             if device.type == "npu":
@@ -413,7 +462,7 @@ class MuseRuntime:
         for item in self.plan:
             for i in range(item["first_layer"], item["last_layer_exclusive"]):
                 self.layers.append(
-                    load_layer(
+                    loader(
                         root,
                         i,
                         self.c,
@@ -438,7 +487,12 @@ class MuseRuntime:
                     if name == PREFIX + "embed_tokens.weight"
                     else devices[-1]
                 )
-                self.globals[name] = tensor.to(device)
+                if optimized and name == "lm_head.weight":
+                    from reap.muse_fast import native_weight
+
+                    self.globals[name] = native_weight(tensor, device)
+                else:
+                    self.globals[name] = tensor.to(device)
         self.reset()
 
     def reset(self):
@@ -489,15 +543,56 @@ class MuseRuntime:
         ):
             raise ValueError("prompt and generation exceed context or are empty")
         self.reset()
+        started = time.monotonic()
+        self.progress(
+            json.dumps(
+                {
+                    "event": "generation_start",
+                    "prompt_tokens": len(ids),
+                    "max_new_tokens": max_new_tokens,
+                }
+            )
+        )
         for start in range(0, len(ids), self.prefill_chunk):
             logits = self.forward(ids[start : start + self.prefill_chunk])
+            self.progress(
+                json.dumps(
+                    {
+                        "event": "prefill_progress",
+                        "tokens": min(start + self.prefill_chunk, len(ids)),
+                        "seconds": time.monotonic() - started,
+                    }
+                )
+            )
+        prefill_seconds = time.monotonic() - started
         result = []
         for step in range(max_new_tokens):
             token = int(logits[0, -1].argmax())
             result.append(token)
+            if len(result) % 16 == 0:
+                self.progress(
+                    json.dumps(
+                        {
+                            "event": "decode_progress",
+                            "tokens": len(result),
+                            "seconds": time.monotonic() - started,
+                        }
+                    )
+                )
             if token in eos or step == max_new_tokens - 1:
                 break
             logits = self.forward([token])
+        total_seconds = time.monotonic() - started
+        self.generation_stats = {
+            "prompt_tokens": len(ids),
+            "completion_tokens": len(result),
+            "prefill_seconds": prefill_seconds,
+            "decode_seconds": total_seconds - prefill_seconds,
+            "total_seconds": total_seconds,
+        }
+        self.progress(
+            json.dumps({"event": "generation_complete", **self.generation_stats})
+        )
         return result
 
 
@@ -509,6 +604,7 @@ def main():
     parser.add_argument("--prefill-chunk", type=int, default=64)
     parser.add_argument("--reserve-gib", type=float, default=3)
     parser.add_argument("--plan-only", action="store_true")
+    parser.add_argument("--optimized", action="store_true")
     parser.add_argument("--library", type=Path)
     parser.add_argument("--input-ids", type=int, nargs="+")
     parser.add_argument("--max-new-tokens", type=int, default=16)
@@ -517,7 +613,11 @@ def main():
         print(
             json.dumps(
                 placement_plan(
-                    args.model, args.devices, args.max_context, args.reserve_gib
+                    args.model,
+                    args.devices,
+                    args.max_context,
+                    args.reserve_gib,
+                    optimized=args.optimized,
                 ),
                 indent=2,
             )
@@ -540,6 +640,7 @@ def main():
         max_context=args.max_context,
         prefill_chunk=args.prefill_chunk,
         reserve_gib=args.reserve_gib,
+        optimized=args.optimized,
     )
     generation = (
         json.loads((args.model / "generation_config.json").read_text())
