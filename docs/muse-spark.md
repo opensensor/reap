@@ -280,17 +280,21 @@ HF_HUB_OFFLINE=1 CUDA_VISIBLE_DEVICES='' PYTHONPATH=src python -m pytest -q \
   tests/test_muse_evaluate.py tests/test_muse_corpus.py tests/test_muse_experiment.py
 ```
 
-## Remaining milestones
+## Coding pilot and remaining quality checks
 
-1. Complete the 62-layer coding screen and review held-out loss/logit drift and
-   expert coverage. Extend to longer contexts and executable coding tasks before
-   choosing a final pruning recipe. Near-constant post-normalization expert norms
-   mean REAP may closely track conditional average routing weight on Muse.
-2. Stream a separate pruned checkpoint with tensor slicing, index/config updates,
-   retained-ID provenance, interrupted-run handling, and native reload parity.
-3. Evaluate W4 quantization and the Ascend backend independently. Pruning quality,
-   quantization quality, simulator parity, and actual device allocation/throughput
-   are separate checks. Keeping top-8 does not halve active expert computation.
+The 62-layer coding pilot selected contribution-weighted pruning to 128 experts
+per layer for deployment bring-up. Calibration used 96 records (39,588 tokens),
+and validation used 24 records (9,825 tokens), with a 512-token record limit.
+Before quantization, validation perplexity increased from 2.24332 to 2.30044
+(+2.55%); mean teacher KL was 0.03142 and top-1 agreement was 95.11%.
+These are teacher-forced diagnostics, not executable coding accuracy.
+
+The separate ModelSlim export completed all 62 layers and 189 shards, and its
+transfer to the Ascend host passed SHA-256 verification. Remaining quality work
+includes longer contexts, quantized-versus-pruned logit/loss comparisons, and
+executable coding tasks. Pruning quality, quantization quality, simulator parity,
+and device allocation/throughput are separate checks. Keeping top-8 does not
+halve active expert computation.
 
 ## ModelSlim export for Ascend bring-up
 
@@ -324,14 +328,13 @@ The format is `muse_spark_w4a16_g128_w8attn_v1`:
   explicitly marks `deployment.json` as `serving_ready: false`.
 
 The deployment candidate is contribution-weighted pruning with 128 retained
-experts per layer (top-8 routing unchanged), selected from the coding pilot. The
-next acceptance milestone is a generated response on six Ascend 310P chips,
-followed by an HTTP endpoint and executable coding smoke checks. The intended
-optimized layout is TP2/PP3/EP2. The first standalone runtime instead uses
-sequential complete-layer placement across six devices (PP6), with CPU transport
-at stage boundaries. Capacity and full-model behavior must be verified before
-declaring either configuration usable. The export's `runtime_required` note
-describes the original TP2/PP3/EP2 target, not a hard format restriction.
+experts per layer (top-8 routing unchanged), selected from the coding pilot.
+Full-model loading and HTTP coding generation have now passed on six Ascend
+310P chips; the measured bring-up results are below. The intended optimized
+layout is TP2/PP3/EP2. The first standalone runtime instead uses sequential
+complete-layer placement across six devices (PP6), with CPU transport at stage
+boundaries. Production performance and coding quality remain unqualified. The
+export's `runtime_required` note describes the original TP2/PP3/EP2 target, not a hard format restriction.
 
 `reap.muse_qualify prepare --export EXPORT --output PROBE` extracts three real
 quantized expert projections and CPU FP16 references. On the Ascend host,
@@ -375,7 +378,11 @@ PYTHONPATH=src python -m reap.muse_runtime --model /models/Muse-Spark-Contributi
 On a host with the validated Torch/NPU and custom operator build, source CANN's
 `set_env.sh`, set `ASCEND_CUSTOM_OPP_PATH` to the operator vendor directory, and
 prepend its `op_api/lib` to `LD_LIBRARY_PATH`. Preserve CANN's existing
-`PYTHONPATH` when adding REAP's `src`. Then launch:
+`PYTHONPATH` when adding REAP's `src`. Set
+`PYTORCH_NPU_ALLOC_CONF=expandable_segments:True` before starting Python.
+On the full export, the default allocator exhausted chip 3 with 36.21 GiB live
+but 44.39 GiB reserved; a representative expert-bank allocation with expandable
+segments held 3.094 GiB live and 3.104 GiB reserved. Then launch:
 
 ```sh
 python -m reap.muse_serve --model /models/Muse-Spark-Contribution128-W4A16-W8Attn \
@@ -397,6 +404,20 @@ Chat accepts string content, uses the checkpoint's chat template with default
 unsupported request fields are rejected. One request runs at a time; a busy
 runtime returns HTTP 503. Health becomes available only after weights load.
 
+For a server bound to loopback, forward the port from your client machine:
+
+```sh
+ssh -N -L 8002:127.0.0.1:8002 ASCEND_HOST
+```
+
+Then send a greedy request (the initial runtime can take minutes):
+
+```sh
+curl http://127.0.0.1:8002/v1/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"prompt":"def add(a, b):\n    ","max_tokens":16,"temperature":0}'
+```
+
 Validation so far:
 
 - A small exported native model matches dequantized native full forwards,
@@ -413,11 +434,33 @@ Validation so far:
   full-size Muse generation or coding quality.
 
 `reap.muse_runtime_qualify prepare` builds the real first-layer native reference;
-`run` verifies full and cached execution on the host. Full-model quantized
-quality, real generation, actual resident memory, and throughput remain to be
-measured after the full export is staged and the six chips are available.
+`run` verifies full and cached execution on the host.
 
-`reap.muse_deploy` can supervise the remaining deployment without stopping another
+On 2026-10-18, runtime commit `6796c68` loaded the complete 189-shard export on
+six physical 310P3 chips using expandable allocator segments. The first real
+`/v1/completions` request completed successfully: prompt `def add(a, b):` plus
+newline/indentation generated `return a + b` and a subtraction function.
+The resulting Python parsed and passed eight arithmetic assertions (positive,
+negative, zero, and fractional inputs), after a strict AST allowlist check.
+This is a trivial executable smoke, not a coding benchmark.
+
+That request used seven prompt tokens and generated 16 tokens in 116.27 seconds,
+including prompt processing and first-request overhead. Its aggregate output
+rate was about 0.138 tokens/second; this is not a steady-state decode benchmark.
+During generation, `npu-smi` reported server process memory of approximately
+34.6–40.6 GiB per chip, with the highest total device usage about 41.8 GiB.
+The server exposes an 8,192-token limit, but long-context capacity and quality
+have not yet been tested. Quantized coding quality, longer-context correctness,
+and performance optimization remain outstanding.
+
+The full-model `/v1/chat/completions` smoke also returned HTTP 200, correctly
+separating reasoning and answer text. It used 162 prompt tokens and generated
+64 tokens in 540.71 seconds. The output allowance ended during the final function
+(`finish_reason: length`); this is chat-format validation, not a completed chat
+coding result. Reasoning consumes the same output allowance: request more than
+64 output tokens for useful chat answers, and inspect `finish_reason`.
+
+`reap.muse_deploy` can supervise deployment without stopping another
 service. It waits for the transfer's `transfer-verified.json`, checks all six
 NPUs against the placement budget, launches the server, verifies that health
 belongs to its child process, and captures a nonempty 16-token coding completion.
