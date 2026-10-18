@@ -130,3 +130,26 @@ def test_text_parts_and_reasoning_history_without_accepting_images():
         {"type": "image_url", "image_url": {"url": "invalid"}}
     ]
     assert client.post("/v1/chat/completions", json=body).status_code == 422
+
+
+def test_disconnect_before_iterator_starts_releases_lock():
+    async def exercise():
+        lock = threading.Lock()
+        lock.acquire()
+        response = streaming_response(
+            Runtime(), PieceTokenizer(), [1], 3, [], False, "muse", lock
+        )
+
+        async def send(message):
+            raise OSError("disconnected before response headers")
+
+        async def receive():
+            return {"type": "http.disconnect"}
+
+        with pytest.raises(Exception):
+            await response(
+                {"type": "http", "asgi": {"spec_version": "2.4"}}, receive, send
+            )
+        assert not lock.locked()
+
+    asyncio.run(exercise())

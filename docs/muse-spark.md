@@ -895,3 +895,64 @@ and dense stages remain sequential, and expert projections still gather through
 host memory. Further work should measure those costs before changing kernels or
 numerics. Local deployment evidence is in `../results/muse-opt-v4/final-summary.json`
 and the two validation summaries alongside it.
+
+### Native token streaming and vLLM migration
+
+Runtime `aef08bd` adds `stream: true` for completion and text-chat requests.
+Each generated token reaches an SSE response during generation. Chat deltas
+separate `reasoning_content` and `content`, withhold partial Muse channel markers
+and incomplete Unicode, and finish with the normal stop/length reason and
+`[DONE]`. `stream_options: {"include_usage": true}` adds a final usage event.
+Disconnects cancel at a generation boundary; the request lock stays held until
+the worker has stopped and reset its KV cache. Streaming preserves greedy token
+selection and the single-request admission policy. It does not add tool calls.
+
+The Kilo provider is `muse-ascend/Muse-Spark-Contribution128-W4A16-W8Attn`, with
+the `muse-chat` agent for text/code discussion. The workstation forwards
+`127.0.0.1:18001` to threadripper's loopback port 8001 through the user service
+`muse-kilo-tunnel.service`. No buffered compatibility bridge is needed for the
+streaming runtime. Kilo's configuration reserves 4,096 output tokens within the
+98,304-token context and keeps the existing default model unchanged.
+
+Local source inspection found that QFN's `tools/sidecard/qfn_resident_server.py`
+wraps the real vLLM API/engine factory and subprocess executor. Its worker
+extension in `qfn_resident_worker.py` adds model-runner RPCs, graph retirement,
+collective lifetimes and prefix-state management. Those controls are reusable
+patterns; they do not themselves implement a model's forward or weight loader.
+The inspected local vLLM and vllm-ascend model registries have no Muse adapter.
+
+Moving Muse onto that engine requires the following work:
+
+1. Implement/register Muse's text-model forward, including latent projections,
+   selection-only router bias, expert output normalization and gated residuals.
+   Bind the existing export receipts and packed W4/W8 loading to vLLM's loader.
+2. Select a supported parallel layout before changing execution. The current
+   ragged six-rank expert shards are not stock equal-width tensor parallelism.
+   Muse's 128 query heads also fail the inspected vLLM configuration check for
+   TP=6. TP=2/PP=3 satisfies head divisibility but reduces the number of chips
+   working on each layer; it needs a latency/memory comparison before adoption.
+   Retaining all-six-chip expert execution needs a custom parallel adapter.
+3. Integrate full and sliding FP16 KV with vLLM's cache manager and attention
+   metadata; qualify chunked prefill, prefix reuse, cancellation and interleaved
+   requests. The current single-request AppendCache cannot be shared unchanged
+   by a continuous batching scheduler.
+4. Reuse the QFN resident/collective lifecycle after validating the communication
+   operation. Muse currently concatenates independent output shards; replacing
+   this with an all-reduce would change the arithmetic. Capture graph-safe
+   gathers, then gate complete logits and executable coding responses before
+   comparing single-request latency and concurrent throughput.
+
+The next native-kernel experiment flattened decode row/tile scheduling to reduce
+idle cores on 640-channel shards. It passed exact hardware checks and full-model
+resident switch gates, but median short decode changed only from 1.996 to
+2.008 tok/s over three repetitions (0.6%). It was not promoted. A separate
+grouped-prefill table-reuse variant failed exact output checks and was rejected
+before resident loading. The streaming runtime retains the established native
+1024 backend and skips redundant device-context visits for prepared decode graphs.
+
+Deployment note: the first streaming-runtime reload on 2026-10-18 stopped after
+layer 16 when Linux 7.0.0-38 faulted in `xas_find_conflict` during a file-cache
+read. The process was terminated and released all six NPUs. Native streaming
+deployment validation is pending host recovery; CPU HTTP tests are not a claim
+that the NPU endpoint is currently online. Diagnostics and experiment receipts
+are under `../runs/muse-opt-v5` and `../results/muse-opt-v5`.

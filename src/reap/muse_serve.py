@@ -102,8 +102,10 @@ def streaming_response(
 ):
     """Keep one device worker and request lock until completion or cancellation."""
     stopped = threading.Event()
+    started = False
 
     async def events():
+        nonlocal started
         loop = asyncio.get_running_loop()
         queue = asyncio.Queue()
 
@@ -132,6 +134,8 @@ def streaming_response(
             finally:
                 try:
                     runtime.reset()
+                except Exception as exc:
+                    result = ("error", str(exc))
                 finally:
                     lock.release()
             if result is not None:
@@ -157,7 +161,12 @@ def streaming_response(
             return {**base, "choices": [choice]}
 
         worker = threading.Thread(target=produce, name="muse-generation", daemon=True)
-        worker.start()
+        started = True
+        try:
+            worker.start()
+        except Exception:
+            lock.release()
+            raise
         tokens, emitted = [], {}
         try:
             if chat:
@@ -202,10 +211,23 @@ def streaming_response(
                         )
                     yield "data: [DONE]\n\n"
                     return
+        except Exception as exc:
+            yield frame({"error": {"message": str(exc), "type": "stream_error"}})
         finally:
             stopped.set()
 
-    return StreamingResponse(
+    class Response(StreamingResponse):
+        async def __call__(self, scope, receive, send):
+            try:
+                await super().__call__(scope, receive, send)
+            finally:
+                stopped.set()
+                # A disconnect while sending response headers can prevent the
+                # iterator (and its worker/finally block) from starting at all.
+                if not started:
+                    lock.release()
+
+    return Response(
         events(),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
