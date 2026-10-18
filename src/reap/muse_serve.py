@@ -69,6 +69,7 @@ def create_app(
             "max_context": runtime.max_context,
             "execution": "sequential layer placement; greedy; single request",
             "optimized": getattr(runtime, "optimized", False),
+            "flash_attention": getattr(runtime, "flash_attention", False),
         }
 
     @app.get("/v1/models")
@@ -184,7 +185,14 @@ def main():
     parser.add_argument("--port", type=int, default=8002)
     parser.add_argument("--served-model-name")
     parser.add_argument("--optimized", action="store_true")
+    parser.add_argument("--flash-attention", action="store_true")
     args = parser.parse_args()
+    if args.flash_attention and (
+        not args.optimized or not 1 <= args.max_context <= 65536
+    ):
+        parser.error(
+            "--flash-attention requires --optimized and context between 1 and 65536"
+        )
     torch.set_num_threads(8 if args.optimized else 2)
     if any(d.startswith("npu:") for d in args.devices):
         import torch_npu
@@ -206,6 +214,7 @@ def main():
         prefill_chunk=args.prefill_chunk,
         reserve_gib=args.reserve_gib,
         optimized=args.optimized,
+        flash_attention=args.flash_attention,
     )
     torch.set_num_threads(2)
     uvicorn.run(

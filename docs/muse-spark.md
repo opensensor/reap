@@ -492,3 +492,48 @@ resident memory to eliminate repeated dequantization and format conversions.
 Generation logs now report prompt processing progress, output-token progress,
 and separate prefill/decode durations. A CPU-only host can calculate optimized
 NPU placement with `--plan-only --optimized`, without importing torch_npu.
+
+The complete optimized model was measured against three fixed coding completion
+requests on the same six chips. Responses matched the reference text exactly:
+
+| Request | Reference seconds | Optimized seconds | Speedup |
+| --- | ---: | ---: | ---: |
+| Add, 7 prompt / 16 output tokens | 115.28 | 24.99 | 4.61x |
+| Reverse, 6 prompt / 8 output tokens | 62.87 | 13.85 | 4.54x |
+| Factorial, 15 prompt / 8 output tokens | 72.88 | 16.70 | 4.37x |
+
+A text-chat request with 162 prompt tokens finished after 72 generated tokens in
+133.50 seconds, returned a complete addition function, and passed four arithmetic
+assertions. These are latency and regression smokes, not a coding benchmark.
+`scripts/benchmark_muse_http.py` records requests, responses, timings, and optional
+baseline text comparisons.
+
+## Fused attention and 64K context
+
+Add `--flash-attention --max-context 65536` to `--optimized` to use the installed
+310P BNSD incremental fused-attention kernel. Muse's eight query heads per KV head
+permit four query tokens per kernel call; larger prefill chunks are split while
+preserving causal and sliding-window masks. Keys and values remain at 16 heads,
+without expansion to 128 heads or materialized attention score/probability
+matrices. Full-attention caches allocate their configured capacity once per
+request and append in place. Sliding caches retain 2,047 tokens plus room for one
+prefill chunk, included in the placement budget. All KV values remain FP16.
+
+The checkpoint's native position limit is 1,048,576. This implementation exposes
+at most **65,536 total prompt plus generated tokens**: the installed 310P kernel
+rejects longer sequences. Extending beyond this limit requires a different
+attention implementation and a revised KV memory/offload strategy; changing a
+configuration value alone is insufficient. RoPE settings and the checkpoint's
+2,048-token sliding window are unchanged. Planning and all launch commands
+reject incompatible fused-attention options before loading weights.
+
+Hardware checks compared four query tokens at a 65,536-token prefix against an
+independent grouped attention reference (maximum absolute error 0.000003815).
+A short valid prefix inside a 65,536-token allocation also passed with unused
+storage filled with NaNs. Real first-layer checks exercised full and incremental
+forwards, sliding and full caches. Fused versus reference prefill maximum error
+was 0.0078125; cached versus native CPU maximum error was 0.0087891, RMSE 0.000765,
+using rtol=0.01/atol=0.01. This is a small FP16 rounding change, so full-model text
+regression checks remain necessary. CPU tests cover causal masks, sliding-window
+rollover, chunk boundaries, stable allocation, and excluded capacity. Kernel and
+cache capacity checks do not establish full-model 64K retrieval or coding quality.

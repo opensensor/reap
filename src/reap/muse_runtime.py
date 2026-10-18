@@ -152,7 +152,7 @@ class MuseLayer:
             input_scaled=input_scaled,
         )
 
-    def attention(self, x, start, cache=None):
+    def attention_inputs(self, x, start):
         c = self.c
         count = x.shape[1]
         q, k, v = [
@@ -180,6 +180,12 @@ class MuseLayer:
                 )
 
             q, k = rotate(q), rotate(k)
+        return q, k, v, positions
+
+    def attention(self, x, start, cache=None):
+        c = self.c
+        count = x.shape[1]
+        q, k, v, positions = self.attention_inputs(x, start)
         previous = 0
         if cache is not None:
             if cache.seen != start:
@@ -212,8 +218,12 @@ class MuseLayer:
         probabilities = F.softmax(scores + mask, dim=-1, dtype=torch.float32).to(
             q.dtype
         )
-        attended = torch.matmul(probabilities, v).transpose(1, 2).contiguous()
-        attended = rms(attended, c.rms_norm_eps).reshape(1, count, -1)
+        attended = torch.matmul(probabilities, v)
+        return self.attention_output(attended, x)
+
+    def attention_output(self, attended, x):
+        attended = attended.transpose(1, 2).contiguous()
+        attended = rms(attended, self.c.rms_norm_eps).reshape(1, x.shape[1], -1)
         attended = attended * torch.sigmoid(self.linear("self_attn.gate_proj", x))
         return self.linear("self_attn.o_proj", attended)
 
@@ -295,7 +305,16 @@ def load_layer(root, index, config, device, *, journal=None, verify=True):
     return MuseLayer(config, index, values)
 
 
-def placement_plan(root, devices, max_context=8192, reserve_gib=3, *, optimized=False):
+def placement_plan(
+    root,
+    devices,
+    max_context=8192,
+    reserve_gib=3,
+    *,
+    optimized=False,
+    flash_attention=False,
+    prefill_chunk=64,
+):
     """Minimax contiguous layer placement, including globals and bounded KV."""
     root = Path(root)
     journal = json.loads((root / "export-progress.json").read_text())
@@ -318,6 +337,8 @@ def placement_plan(root, devices, max_context=8192, reserve_gib=3, *, optimized=
         or len(devices) > c.num_hidden_layers
         or max_context < 1
         or reserve_gib < 0
+        or not 1 <= prefill_chunk <= 128
+        or (flash_attention and (not optimized or max_context > 65536))
     ):
         raise ValueError("invalid placement request")
     costs = []
@@ -350,7 +371,10 @@ def placement_plan(root, devices, max_context=8192, reserve_gib=3, *, optimized=
                             - receipt["bytes"]
                         )
         tokens = (
-            min(max_context, c.sliding_window - 1)
+            min(
+                max_context,
+                c.sliding_window - 1 + (prefill_chunk if flash_attention else 0),
+            )
             if c.layer_types[i] == "sliding_attention"
             else max_context
         )
@@ -406,6 +430,7 @@ class MuseRuntime:
         verify=True,
         progress=print,
         optimized=False,
+        flash_attention=False,
     ):
         self.root = Path(root)
         self.progress = progress
@@ -431,10 +456,23 @@ class MuseRuntime:
             raise ValueError("invalid context or prefill size")
         self.max_context, self.prefill_chunk = max_context, prefill_chunk
         self.optimized = optimized
+        self.flash_attention = flash_attention
+        if flash_attention and (
+            not optimized or max_context > 65536 or self.c.head_dim > 128
+        ):
+            raise ValueError(
+                "310P fused attention requires optimized mode, context <= 65536, and head_dim <= 128"
+            )
         if optimized and any(not str(d).startswith("npu:") for d in devices):
             raise ValueError("optimized execution requires explicit NPU devices")
         self.plan = placement_plan(
-            root, devices, max_context, reserve_gib, optimized=optimized
+            root,
+            devices,
+            max_context,
+            reserve_gib,
+            optimized=optimized,
+            flash_attention=flash_attention,
+            prefill_chunk=prefill_chunk,
         )
         loader = load_layer
         if optimized:
@@ -471,6 +509,9 @@ class MuseRuntime:
                         verify=verify,
                     )
                 )
+                self.layers[-1].max_context = max_context
+                self.layers[-1].prefill_chunk = prefill_chunk
+                self.layers[-1].flash_attention = flash_attention
                 progress(
                     json.dumps(
                         {"event": "loaded_layer", "layer": i, "device": item["device"]}
@@ -496,7 +537,12 @@ class MuseRuntime:
         self.reset()
 
     def reset(self):
-        self.cache = [LayerCache() for _ in self.layers]
+        if self.flash_attention:
+            from reap.muse_attention import AppendCache
+
+            self.cache = [AppendCache() for _ in self.layers]
+        else:
+            self.cache = [LayerCache() for _ in self.layers]
         self.seen = 0
 
     @torch.inference_mode()
@@ -605,10 +651,17 @@ def main():
     parser.add_argument("--reserve-gib", type=float, default=3)
     parser.add_argument("--plan-only", action="store_true")
     parser.add_argument("--optimized", action="store_true")
+    parser.add_argument("--flash-attention", action="store_true")
     parser.add_argument("--library", type=Path)
     parser.add_argument("--input-ids", type=int, nargs="+")
     parser.add_argument("--max-new-tokens", type=int, default=16)
     args = parser.parse_args()
+    if args.flash_attention and (
+        not args.optimized or not 1 <= args.max_context <= 65536
+    ):
+        parser.error(
+            "--flash-attention requires --optimized and context between 1 and 65536"
+        )
     if args.plan_only:
         print(
             json.dumps(
@@ -618,6 +671,8 @@ def main():
                     args.max_context,
                     args.reserve_gib,
                     optimized=args.optimized,
+                    flash_attention=args.flash_attention,
+                    prefill_chunk=args.prefill_chunk,
                 ),
                 indent=2,
             )
@@ -641,6 +696,7 @@ def main():
         prefill_chunk=args.prefill_chunk,
         reserve_gib=args.reserve_gib,
         optimized=args.optimized,
+        flash_attention=args.flash_attention,
     )
     generation = (
         json.loads((args.model / "generation_config.json").read_text())

@@ -105,6 +105,26 @@ class FastMuseLayer(MuseLayer):
         super().__init__(config, index, weights)
         self.gate_up, self.down = gate_up, down
 
+    def attention(self, x, start, cache=None):
+        if not getattr(self, "flash_attention", False):
+            return super().attention(x, start, cache)
+        from reap.muse_attention import flash_attention
+
+        q, k, v, _ = self.attention_inputs(x, start)
+        attended = flash_attention(
+            q,
+            k,
+            v,
+            start=start,
+            cache=cache,
+            window=self.c.sliding_window
+            if self.c.layer_types[self.index] == "sliding_attention"
+            else None,
+            max_context=self.max_context,
+            prefill_chunk=self.prefill_chunk,
+        )
+        return self.attention_output(attended, x)
+
     def moe(self, x):
         c = self.c
         flat = x.reshape(-1, x.shape[-1])
