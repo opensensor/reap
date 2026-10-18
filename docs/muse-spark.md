@@ -995,3 +995,21 @@ uses synthetic eight-expert banks and the unpromoted flattened kernel; it is not
 a full-model speedup. The live layout remains on 128-channel shard alignment.
 Evidence is in `decode-profile.json`, `staged-transfer-performance.json` and
 `balanced32-qualification.json` under `../results/muse-opt-v5`.
+
+### Reusing prompt prefixes
+
+`muse_serve` and `muse_deploy` accept `--prefix-cache` with bounded attention.
+After a successful request, the worker keeps one prompt prefix ending at a
+prefill-chunk boundary. An identical prompt shorter than one chunk can also
+reuse its cached logits. Extensions of partial chunks are recomputed, preserving
+the uncached suffix's GEMM and attention shapes. Generated tokens are never
+included in the retained prompt prefix.
+
+Full-attention KV shares its existing append-only allocation. Sliding attention
+retains a separate copy of only the valid window, then restores it before reuse;
+this remains correct after decode has moved the active sliding buffer. Placement
+reserves space for old and replacement sliding snapshots to coexist. The total
+context limit and FP16 KV precision are unchanged. Cancelled/failed requests and
+resident model changes discard the prefix. Health reports `prefix_cache`, and
+generation logs report `cached_prompt_tokens`; cold throughput and reused-prefix
+latency must be reported separately.

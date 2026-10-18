@@ -315,8 +315,11 @@ def placement_plan(
     bounded_attention=False,
     prefill_chunk=64,
     tensor_experts=False,
+    prefix_cache=False,
 ):
     """Minimax contiguous layer placement, including globals and bounded KV."""
+    if prefix_cache and not bounded_attention:
+        raise ValueError("prefix cache requires bounded attention")
     root = Path(root)
     journal = json.loads((root / "export-progress.json").read_text())
     if not journal["complete"]:
@@ -379,6 +382,10 @@ def placement_plan(
             if c.layer_types[i] == "sliding_attention"
             else max_context
         )
+        if prefix_cache:
+            from reap.muse_prefix import snapshot_reserve_bytes
+
+            weight += snapshot_reserve_bytes(c, i, max_context)
         costs.append(weight + tokens * 2 * c.num_key_value_heads * c.head_dim * 2)
     globals_ = {
         name: receipt["bytes"]
@@ -424,7 +431,15 @@ def placement_plan(
             )
         from reap.muse_tensor import tensor_plan
 
-        return tensor_plan(c, journal, stages, max_context, prefill_chunk, reserve_gib)
+        return tensor_plan(
+            c,
+            journal,
+            stages,
+            max_context,
+            prefill_chunk,
+            reserve_gib,
+            prefix_cache=prefix_cache,
+        )
     return stages
 
 
@@ -443,6 +458,7 @@ class MuseRuntime:
         bounded_attention=False,
         packed_cache=None,
         tensor_experts=False,
+        prefix_cache=False,
     ):
         self.root = Path(root)
         self.progress = progress
@@ -469,6 +485,7 @@ class MuseRuntime:
         self.max_context, self.prefill_chunk = max_context, prefill_chunk
         self.optimized = optimized
         self.tensor_experts = tensor_experts
+        self.prefix_cache_enabled = prefix_cache
         self.execution = (
             "tensor-parallel experts; sequential dense stages"
             if tensor_experts
@@ -490,6 +507,7 @@ class MuseRuntime:
             bounded_attention=bounded_attention,
             prefill_chunk=prefill_chunk,
             tensor_experts=tensor_experts,
+            prefix_cache=prefix_cache,
         )
         loader = load_layer
         if optimized:
@@ -591,7 +609,9 @@ class MuseRuntime:
             if hasattr(layer, "tensor_experts"):
                 layer.tensor_experts.invalidate_graphs()
 
-    def reset(self):
+    def reset(self, *, preserve_prefix=False):
+        if not preserve_prefix:
+            self.prefix_snapshot = None
         if self.bounded_attention:
             from reap.muse_attention import AppendCache
 
@@ -599,6 +619,9 @@ class MuseRuntime:
         else:
             self.cache = [LayerCache() for _ in self.layers]
         self.seen = 0
+
+    def release_request_cache(self):
+        self.reset(preserve_prefix=True)
 
     @torch.inference_mode()
     def forward(self, ids, *, all_logits=False):
@@ -649,21 +672,41 @@ class MuseRuntime:
             or len(ids) + max_new_tokens > self.max_context
         ):
             raise ValueError("prompt and generation exceed context or are empty")
-        self.reset()
         started = time.monotonic()
+        prefix = getattr(self, "prefix_snapshot", None)
+        enabled = getattr(self, "prefix_cache_enabled", False)
+        self.cache = []
+        self.seen = 0
+        if enabled and prefix is not None and prefix.matches(ids, self.prefill_chunk):
+            self.cache = prefix.restore()
+            self.seen = len(prefix.tokens)
+            logits = prefix.logits
+        else:
+            self.reset()
+        del prefix
+        cached_tokens = self.seen
+        pending_prefix = getattr(self, "prefix_snapshot", None)
+        boundary = len(ids) // self.prefill_chunk * self.prefill_chunk or len(ids)
         self.progress(
             json.dumps(
                 {
                     "event": "generation_start",
                     "prompt_tokens": len(ids),
                     "max_new_tokens": max_new_tokens,
+                    "cached_prompt_tokens": cached_tokens,
                 }
             )
         )
-        for start in range(0, len(ids), self.prefill_chunk):
+        for start in range(cached_tokens, len(ids), self.prefill_chunk):
             if cancel is not None and cancel.is_set():
                 raise InterruptedError("generation cancelled")
             logits = self.forward(ids[start : start + self.prefill_chunk])
+            if enabled and self.seen == boundary:
+                from reap.muse_prefix import PrefixSnapshot
+
+                pending_prefix = PrefixSnapshot.capture(
+                    ids[:boundary], logits, self.cache, self.c.layer_types
+                )
             self.progress(
                 json.dumps(
                     {
@@ -696,8 +739,10 @@ class MuseRuntime:
                 break
             logits = self.forward([token])
         total_seconds = time.monotonic() - started
+        self.prefix_snapshot = pending_prefix
         self.generation_stats = {
             "prompt_tokens": len(ids),
+            "cached_prompt_tokens": cached_tokens,
             "completion_tokens": len(result),
             "prefill_seconds": prefill_seconds,
             "decode_seconds": total_seconds - prefill_seconds,

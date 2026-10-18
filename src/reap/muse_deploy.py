@@ -65,6 +65,7 @@ def run(args):
                 bounded_attention=args.bounded_attention,
                 prefill_chunk=args.prefill_chunk,
                 tensor_experts=getattr(args, "tensor_experts", False),
+                prefix_cache=getattr(args, "prefix_cache", False),
             )
             while True:
                 memory = []
@@ -104,6 +105,8 @@ def run(args):
                 command.append("--optimized")
             if args.bounded_attention:
                 command.append("--bounded-attention")
+            if getattr(args, "prefix_cache", False):
+                command.append("--prefix-cache")
             for option in (
                 "packed_cache",
                 "resident_token_file",
@@ -208,6 +211,7 @@ def main():
     parser.add_argument("--tensor-experts", action="store_true")
     parser.add_argument("--deterministic", action="store_true")
     parser.add_argument("--bounded-attention", action="store_true")
+    parser.add_argument("--prefix-cache", action="store_true")
     parser.add_argument("--packed-cache", type=Path)
     parser.add_argument("--resident-token-file", type=Path)
     parser.add_argument("--native-manifest", type=Path)

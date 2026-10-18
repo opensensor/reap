@@ -254,3 +254,75 @@ def test_large_prefill_requires_bounded_optimized_execution(exported):
                 optimized=optimized,
                 bounded_attention=bounded,
             )
+
+
+def test_prefix_reuse_preserves_outputs_after_sliding_rollover(exported):
+    from types import MethodType
+    from reap.muse_fast import FastMuseLayer
+
+    def make(enabled):
+        runtime = MuseRuntime(
+            exported, max_context=32, prefill_chunk=4, progress=lambda _: None
+        )
+        # Use the real bounded attention/cache path with the CPU reference
+        # projections; optimized packed kernels are separately tested on NPUs.
+        runtime.bounded_attention = True
+        runtime.prefix_cache_enabled = enabled
+        for layer in runtime.layers:
+            layer.bounded_attention = True
+            layer.max_context = 32
+            layer.prefill_chunk = 4
+            layer.attention = MethodType(FastMuseLayer.attention, layer)
+        runtime.reset()
+        return runtime
+
+    cached, cold = make(True), make(False)
+    cases = [
+        ([1, 4, 7, 8, 9, 10, 12, 3, 2], 0),
+        ([1, 4, 7, 8, 9, 10, 12, 3, 5, 6], 8),
+        ([1, 4, 7, 8, 9, 10, 12, 3], 8),
+        ([1, 5, 7, 8, 9, 10, 12, 3], 0),
+        ([1, 4, 7], 0),
+        ([1, 4, 7], 3),
+        ([1, 4, 7, 8], 0),
+    ]
+    for prompt, reused in cases:
+        assert cached.generate(prompt, 6) == cold.generate(prompt, 6)
+        assert cached.generation_stats["cached_prompt_tokens"] == reused
+        assert cold.generation_stats["cached_prompt_tokens"] == 0
+        # Every request decodes far enough to move the small sliding window.
+        assert all(c.seen > cached.c.sliding_window for c in cached.cache)
+        cached.release_request_cache()
+        assert cached.seen == 0 and all(c.key is None for c in cached.cache)
+        assert cached.prefix_snapshot is not None
+    cached.reset()
+    assert cached.prefix_snapshot is None
+    assert cached.generate(cases[-1][0], 6) == cold.generate(cases[-1][0], 6)
+    assert cached.generation_stats["cached_prompt_tokens"] == 0
+
+
+def test_prefix_placement_reserves_both_sliding_snapshots(exported):
+    config = configuration(json.loads((exported / "config.json").read_text()))
+    common = dict(
+        max_context=16,
+        reserve_gib=0,
+        optimized=True,
+        bounded_attention=True,
+        prefill_chunk=4,
+    )
+    plain = placement_plan(exported, ["cpu"], **common)[0]["required_bytes"]
+    cached = placement_plan(exported, ["cpu"], prefix_cache=True, **common)[0][
+        "required_bytes"
+    ]
+    expected = (
+        2
+        * config.layer_types.count("sliding_attention")
+        * min(16, config.sliding_window - 1)
+        * 2
+        * config.num_key_value_heads
+        * config.head_dim
+        * 2
+    )
+    assert cached - plain == expected
+    with pytest.raises(ValueError, match="bounded attention"):
+        placement_plan(exported, ["cpu"], prefix_cache=True)

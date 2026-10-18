@@ -280,7 +280,16 @@ def make_pool(devices):
     return RankPool(devices)
 
 
-def tensor_plan(config, journal, stages, max_context, prefill_chunk, reserve_gib):
+def tensor_plan(
+    config,
+    journal,
+    stages,
+    max_context,
+    prefill_chunk,
+    reserve_gib,
+    *,
+    prefix_cache=False,
+):
     """Account for every shard, dense NZ matrix, KV slot, and global tensor."""
     from reap.muse_runtime import PREFIX
 
@@ -302,6 +311,10 @@ def tensor_plan(config, journal, stages, max_context, prefill_chunk, reserve_gib
             else max_context
         )
         dense[index] += tokens * 2 * config.num_key_value_heads * config.head_dim * 2
+        if prefix_cache:
+            from reap.muse_prefix import snapshot_reserve_bytes
+
+            dense[index] += snapshot_reserve_bytes(config, index, max_context)
         for ep in (0, 1):
             for name, record in journal["shards"][
                 f"experts-{index:03d}-ep{ep}.safetensors"

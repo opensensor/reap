@@ -78,6 +78,9 @@ def test_first_token_arrives_before_completion_and_disconnect_cancels():
             self.cancelled.set()
             raise InterruptedError()
 
+        def release_request_cache(self):
+            raise AssertionError("cancelled requests must discard their prefix")
+
         def reset(self):
             self.reset_done.set()
 
@@ -153,3 +156,33 @@ def test_disconnect_before_iterator_starts_releases_lock():
         assert not lock.locked()
 
     asyncio.run(exercise())
+
+
+def test_only_completed_requests_preserve_prefix_cache():
+    class Cached(Runtime):
+        releases = 0
+        fail = False
+
+        def release_request_cache(self):
+            self.releases += 1
+
+        def generate(self, *args, **kwargs):
+            if self.fail:
+                raise FloatingPointError("nonfinite logits")
+            return super().generate(*args, **kwargs)
+
+    runtime = Cached()
+    client = TestClient(
+        create_app(runtime, Tokenizer(), eos=[2]), raise_server_exceptions=False
+    )
+    for stream in (False, True):
+        body = {"prompt": "hello", "max_tokens": 3, "stream": stream}
+        runtime.fail = False
+        before = runtime.releases
+        assert client.post("/v1/completions", json=body).status_code == 200
+        assert runtime.releases == before + 1
+        runtime.fail = True
+        resets = runtime.resets
+        client.post("/v1/completions", json=body)
+        assert runtime.resets == resets + 1
+        assert runtime.releases == before + 1

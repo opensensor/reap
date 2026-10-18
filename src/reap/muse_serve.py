@@ -133,7 +133,14 @@ def streaming_response(
                 result = ("error", str(exc))
             finally:
                 try:
-                    runtime.reset()
+                    if (
+                        result is not None
+                        and result[0] == "done"
+                        and not stopped.is_set()
+                    ):
+                        getattr(runtime, "release_request_cache", runtime.reset)()
+                    else:
+                        runtime.reset()
                 except Exception as exc:
                     result = ("error", str(exc))
                 finally:
@@ -263,6 +270,7 @@ def create_app(
             "optimized": getattr(runtime, "optimized", False),
             "bounded_attention": getattr(runtime, "bounded_attention", False),
             "prefill_chunk": getattr(runtime, "prefill_chunk", None),
+            "prefix_cache": getattr(runtime, "prefix_cache_enabled", False),
             "deterministic": getattr(runtime, "deterministic", False),
             "streaming": True,
             "resident": resident.status() if resident else None,
@@ -374,12 +382,16 @@ def create_app(
                     request.stream_options and request.stream_options.include_usage
                 ),
             )
+        completed = False
         try:
             tokens = runtime.generate(ids, limit, eos=eos)
+            completed = True
         finally:
-            # Caches contain request-specific state; release after success or failure.
             try:
-                runtime.reset()
+                if completed:
+                    getattr(runtime, "release_request_cache", runtime.reset)()
+                else:
+                    runtime.reset()
             finally:
                 lock.release()
         finish = "stop" if tokens and tokens[-1] in eos else "length"
@@ -446,6 +458,7 @@ def main():
     parser.add_argument("--tensor-experts", action="store_true")
     parser.add_argument("--deterministic", action="store_true")
     parser.add_argument("--bounded-attention", action="store_true")
+    parser.add_argument("--prefix-cache", action="store_true")
     parser.add_argument("--packed-cache", type=Path)
     parser.add_argument("--resident-token-file", type=Path)
     parser.add_argument("--native-manifest", type=Path)
@@ -501,6 +514,7 @@ def main():
         bounded_attention=args.bounded_attention,
         packed_cache=args.packed_cache,
         tensor_experts=args.tensor_experts,
+        prefix_cache=args.prefix_cache,
     )
     torch.set_num_threads(1 if args.tensor_experts else 2)
     runtime.deterministic = args.deterministic

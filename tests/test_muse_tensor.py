@@ -169,6 +169,14 @@ def test_memory_plan_conserves_weights_offsets_globals_and_full_context():
         sum(p["required_bytes"] for p in plan)
         == expert_bytes + dense_bytes + kv_bytes + 6 * 3 * 2**30
     )
+    cached = tensor_plan(
+        c, {"shards": shards}, stages, 98304, 512, 3, prefix_cache=True
+    )
+    assert (
+        sum(p["required_bytes"] for p in cached)
+        - sum(p["required_bytes"] for p in plan)
+        == 2 * 9 * (128 - 1) * 2 * 2 * 64 * 2
+    )
     assert plan[0]["first_layer"] == 0 and plan[-1]["last_layer_exclusive"] == 18
     assert all(
         a["last_layer_exclusive"] == b["first_layer"] for a, b in zip(plan, plan[1:])
