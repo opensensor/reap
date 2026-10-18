@@ -898,7 +898,7 @@ and the two validation summaries alongside it.
 
 ### Native token streaming and vLLM migration
 
-Runtime `aef08bd` adds `stream: true` for completion and text-chat requests.
+Runtime `fa9e722` adds `stream: true` for completion and text-chat requests.
 Each generated token reaches an SSE response during generation. Chat deltas
 separate `reasoning_content` and `content`, withhold partial Muse channel markers
 and incomplete Unicode, and finish with the normal stop/length reason and
@@ -913,6 +913,9 @@ the `muse-chat` agent for text/code discussion. The workstation forwards
 `muse-kilo-tunnel.service`. No buffered compatibility bridge is needed for the
 streaming runtime. Kilo's configuration reserves 4,096 output tokens within the
 98,304-token context and keeps the existing default model unchanged.
+A direct native-streaming Kilo smoke (`kilo run --pure --agent muse-chat`)
+returned `OK` with 689 input and 34 output tokens in 41.22 seconds including
+CLI startup. The Kilo token count includes the generated reasoning.
 
 Local source inspection found that QFN's `tools/sidecard/qfn_resident_server.py`
 wraps the real vLLM API/engine factory and subprocess executor. Its worker
@@ -950,9 +953,45 @@ grouped-prefill table-reuse variant failed exact output checks and was rejected
 before resident loading. The streaming runtime retains the established native
 1024 backend and skips redundant device-context visits for prepared decode graphs.
 
-Deployment note: the first streaming-runtime reload on 2026-10-18 stopped after
-layer 16 when Linux 7.0.0-38 faulted in `xas_find_conflict` during a file-cache
-read. The process was terminated and released all six NPUs. Native streaming
-deployment validation is pending host recovery; CPU HTTP tests are not a claim
-that the NPU endpoint is currently online. Diagnostics and experiment receipts
-are under `../runs/muse-opt-v5` and `../results/muse-opt-v5`.
+Runtime `fa9e722` is serving on ports 8001 and 8002 after host recovery on
+2026-10-18. All 62 layers loaded from verified packed-cache entries, and all
+421 frozen runtime files passed SHA256 checks. Native SSE passes exact response,
+reasoning, usage and finish-reason comparisons on three coding completions,
+a chat exchange and the 2,127-token prompt. Disconnecting during decode releases
+the request lock and permits the next exact response without a worker restart.
+The 109 focused Muse tests and CPU socket/disconnect tests also pass.
+
+The short completion delivers its first text at **1.166 seconds**, followed by
+16 incremental text events over 8.716 seconds, at **1.986 decode tok/s**.
+Chat's first visible reasoning/text arrives at **6.271 seconds** and its decode
+rate is **1.992 tok/s**. The 2,127-token prompt measures **31.425 prefill tok/s**
+and **1.919 decode tok/s**, with first text at 67.690 seconds. These are streamed
+single-request measurements; streaming improves visibility, not token production
+speed. Full-model context quality beyond the existing 2,127-token regression
+remains unmeasured.
+
+Recovery corrected a host startup script that expected four Ascend device nodes
+and therefore failed before completing permissions for the six-chip system.
+The bring-up service now expects six; initialization and FP16 matrix checks pass
+on all six chips. The earlier reload encountered a Linux `xas_find_conflict`
+fault during a file-cache read; its cause has not been established. Recovery
+and validation evidence is under `../runs/muse-opt-v5` and
+`../results/muse-opt-v5/stream-validation-summary.json`.
+
+Decode attribution after recovery measures about 285 ms/token in expert
+projection and its host gathers, within 322 ms/token for the full MoE block.
+Attention inputs, cache/scores and output measure about 70, 43 and 98 ms/token.
+These timings synchronize section boundaries and include profiling overhead;
+they are not an end-to-end throughput benchmark. Profiling was removed afterward.
+
+A resident candidate with reusable rank-local pinned transfer buffers passed
+exact-logit and generated-text checks but changed three-run median short decode
+from 2.009 to 1.984 tok/s. It was rejected, and the original Python patch was
+restored with the same worker PID and weight storage identity. An isolated
+32-channel shard-alignment probe also passed exact output checks at 8/137/512
+routed rows, including empty expert groups. Its largest decode shards took about
+7% less time, but 512-row gate/up prefill was about 4.5% slower. This microbenchmark
+uses synthetic eight-expert banks and the unpromoted flattened kernel; it is not
+a full-model speedup. The live layout remains on 128-channel shard alignment.
+Evidence is in `decode-profile.json`, `staged-transfer-performance.json` and
+`balanced32-qualification.json` under `../results/muse-opt-v5`.
