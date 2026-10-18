@@ -9,7 +9,38 @@ FP16 partial products and FP32 sum. No activation quantization is introduced.
 import torch
 import torch.nn.functional as F
 
-from reap.muse_runtime import MuseLayer, load_layer
+from reap.muse_runtime import MuseLayer, load_layer, rms
+
+
+class StepPositions:
+    """Share identical rotary phases across a stage for the current token chunk."""
+
+    def __init__(self):
+        self.key = None
+        self.inv = None
+
+    def get(self, config, x, start, count):
+        theta = config.rope_parameters["rope_theta"]
+        geometry = (x.device, config.head_dim, theta)
+        key = (*geometry, x.dtype, start, count)
+        if key != self.key:
+            if self.inv is None or geometry != self.key[:3]:
+                self.inv = (
+                    1.0
+                    / (
+                        theta
+                        ** (
+                            torch.arange(0, config.head_dim, 2).float()
+                            / config.head_dim
+                        )
+                    )
+                ).to(x.device)
+            positions = torch.arange(start, start + count, device="cpu").to(x.device)
+            freqs = positions[:, None].float() * self.inv
+            phase = torch.cat((freqs, freqs), dim=-1)
+            self.values = positions, phase.cos().to(x.dtype), phase.sin().to(x.dtype)
+            self.key = key
+        return self.values
 
 
 def pack_tiles(value, *, scales=False):
@@ -104,6 +135,91 @@ class FastMuseLayer(MuseLayer):
     def __init__(self, config, index, weights, gate_up, down):
         super().__init__(config, index, weights)
         self.gate_up, self.down = gate_up, down
+        self.positions = StepPositions()
+        self.norm_weights = {
+            name.removesuffix(".weight"): 1.0 + value
+            for name, value in weights.items()
+            if name.endswith("norm.weight")
+        }
+        self.unit_weights = {}
+        self.residual_coefficients = {}
+        for name in ("post_attention", "post_feedforward"):
+            gate = weights.get(name + "_residual_gate.gate")
+            if gate is not None:
+                w = gate / config.residual_gate_temperature
+                beta = torch.sigmoid(w)
+                alpha = torch.sqrt(
+                    torch.clamp(torch.sigmoid(-w) * (1.0 + beta), min=1e-3)
+                )
+                self.residual_coefficients[name] = alpha, beta
+
+    def fast_rms(self, x, eps, weight=None):
+        # The installed 310P RMS kernel produces invalid/stale values for
+        # sub-block rows (observed at width eight). Only use aligned FP16 rows;
+        # small synthetic heads and other dtypes retain the reference path.
+        if x.device.type != "npu" or x.dtype != torch.float16 or x.shape[-1] % 16:
+            return rms(x, eps, weight)
+        import torch_npu
+
+        if weight is None:
+            key = x.shape[-1], x.dtype
+            if key not in self.unit_weights:
+                self.unit_weights[key] = torch.ones(
+                    x.shape[-1], dtype=x.dtype, device=x.device
+                )
+            weight = self.unit_weights[key]
+        return torch_npu.npu_rms_norm(x.contiguous(), weight, eps)[0]
+
+    def norm(self, name, x, *, input_scaled=False):
+        weight = self.norm_weights[name]
+        if input_scaled:
+            # Preserve the model's FP16 rounding *before* the RMS reduction.
+            x = (x.float() * weight.float()).to(x.dtype)
+            return self.fast_rms(x, self.c.post_norm_eps)
+        return self.fast_rms(x, self.c.rms_norm_eps, weight)
+
+    def attention_inputs(self, x, start):
+        c, count = self.c, x.shape[1]
+        q, k, v = [
+            self.linear("self_attn." + name + "_proj", x)
+            .view(1, count, -1, c.head_dim)
+            .transpose(1, 2)
+            for name in ("q", "k", "v")
+        ]
+        q = self.fast_rms(q, c.rms_norm_eps) * c.qk_scale_factor
+        k = self.fast_rms(k, c.rms_norm_eps)
+        positions, cos, sin = self.positions.get(c, x, start, count)
+        if c.layer_rope_theta[self.index]:
+
+            def rotate(t):
+                half = t.shape[-1] // 2
+                return (
+                    t * cos + torch.cat((-t[..., half:], t[..., :half]), dim=-1) * sin
+                )
+
+            q, k = rotate(q), rotate(k)
+        return q, k, v, positions
+
+    def attention_output(self, attended, x):
+        attended = attended.transpose(1, 2).contiguous()
+        attended = self.fast_rms(attended, self.c.rms_norm_eps).reshape(
+            1, x.shape[1], -1
+        )
+        attended = attended * torch.sigmoid(self.linear("self_attn.gate_proj", x))
+        return self.linear("self_attn.o_proj", attended)
+
+    def __call__(self, x, start=0, cache=None):
+        if x.ndim != 3 or x.shape[0] != 1 or x.shape[1] < 1 or start < 0:
+            raise ValueError("runtime supports one contiguous unpadded sequence")
+        h = self.attention(self.norm("input_layernorm", x), start, cache)
+        alpha, beta = self.residual_coefficients["post_attention"]
+        x = (alpha * x + beta * self.fast_rms(h, self.c.post_norm_eps)).to(x.dtype)
+        h = self.moe(self.norm("pre_feedforward_layernorm", x))
+        alpha, beta = self.residual_coefficients["post_feedforward"]
+        return (
+            alpha * x
+            + beta * self.norm("post_feedforward_layernorm", h, input_scaled=True)
+        ).to(x.dtype)
 
     def attention(self, x, start, cache=None):
         if not getattr(self, "bounded_attention", False):
@@ -152,22 +268,37 @@ class FastMuseLayer(MuseLayer):
             "mlp.pre_expert_norm", self.linear("mlp.pre_expert_proj", flat)
         )
         if len(flat) > 1:
-            # This installed routed kernel is optimized for decode. Reusing an
-            # expert's weight tile across its prefill tokens is much faster.
+            # Group once, transfer route metadata once, and batch the shared
+            # normalization/combine epilogue. The expert matmuls still reuse
+            # weights across tokens; no activation quantization is introduced.
+            host_ids = ids.flatten().cpu()
+            permutation = host_ids.argsort(stable=True)
+            experts, counts = host_ids[permutation].unique_consecutive(
+                return_counts=True
+            )
+            rows = (permutation // c.num_experts_per_tok).to(x.device)
+            routes = latent[rows]
+            outputs = []
+            first = 0
+            for expert, count in zip(experts.tolist(), counts.tolist()):
+                gate, up = self.gate_up.linear(
+                    routes[first : first + count], expert=expert
+                ).chunk(2, dim=-1)
+                outputs.append(self.down.linear(F.silu(gate) * up, expert=expert))
+                first += count
+            down = self.norm(
+                "mlp.experts.post_expert_norm", torch.cat(outputs), input_scaled=True
+            )
+            # Restore token-major, ascending-expert order before the FP16 sum.
+            ordered = torch.empty_like(down)
+            ordered.index_copy_(0, permutation.to(x.device), down)
+            contributions = (
+                ordered.view(len(flat), c.num_experts_per_tok, -1)
+                * coefficients[:, :, None]
+            ).to(latent.dtype)
             mixed = torch.zeros_like(latent)
-            host_ids = ids.cpu()
-            for expert in sorted(set(host_ids.flatten().tolist())):
-                tokens, slots = torch.where(host_ids == expert)
-                tokens, slots = tokens.to(x.device), slots.to(x.device)
-                gate, up = self.gate_up.linear(latent[tokens], expert=expert).chunk(
-                    2, dim=-1
-                )
-                down = self.down.linear(F.silu(gate) * up, expert=expert)
-                down = self.norm(
-                    "mlp.experts.post_expert_norm", down, input_scaled=True
-                )
-                down = (down * coefficients[tokens, slots, None]).to(mixed.dtype)
-                mixed.index_add_(0, tokens, down)
+            for slot in range(c.num_experts_per_tok):
+                mixed = mixed + contributions[:, slot]
             return self.linear("mlp.post_expert_proj", mixed).view_as(x)
         mixed = []
         tokens_per_chunk = 80 // c.num_experts_per_tok

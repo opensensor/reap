@@ -212,3 +212,28 @@ def test_bounded_placement_includes_sliding_append_capacity(exported):
             optimized=False,
             bounded_attention=True,
         )
+
+
+def test_large_prefill_requires_bounded_optimized_execution(exported):
+    plan = placement_plan(
+        exported,
+        ["npu:0"],
+        max_context=1024,
+        prefill_chunk=512,
+        optimized=True,
+        bounded_attention=True,
+    )
+    assert plan[0]["last_layer_exclusive"] == 3
+    for optimized, bounded, chunk in (
+        (False, False, 512),
+        (True, False, 512),
+        (True, True, 513),
+    ):
+        with pytest.raises(ValueError, match="invalid placement"):
+            placement_plan(
+                exported,
+                ["npu:0"],
+                prefill_chunk=chunk,
+                optimized=optimized,
+                bounded_attention=bounded,
+            )

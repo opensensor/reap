@@ -86,3 +86,48 @@ def test_bounded_context_guard_precedes_operator():
         bounded_attention(
             q, k, k, start=65536, max_context=65536, op=lambda *a, **kw: None
         )
+
+
+@pytest.mark.parametrize("window", [None, 31])
+def test_adaptive_prefill_tiles_preserve_masks_and_score_budget(monkeypatch, window):
+    import reap.muse_attention as module
+
+    torch.manual_seed(916)
+    q = torch.randn(1, 16, 137, 16).half() * 0.2
+    k = torch.randn(1, 2, 137, 16).half() * 0.2
+    v = torch.randn_like(k)
+    positions = torch.arange(137)
+    allowed = positions[None, :] <= positions[:, None]
+    if window:
+        allowed &= positions[None, :] > positions[:, None] - window
+    expected = reference(q, k, v, allowed)
+    calls = []
+
+    def record(query, key, value, **kw):
+        length = kw["actual_seq_lengths"][0]
+        calls.append(query.shape[-2])
+        assert query.shape[-2] * 8 * length <= 32 * 512
+        return grouped_attention(query, key, value, **kw)
+
+    monkeypatch.setattr(module, "grouped_attention", record)
+    cache = AppendCache()
+    outputs = []
+    for start, count in ((0, 128), (128, 9)):
+        outputs.append(
+            bounded_attention(
+                q[:, :, start : start + count],
+                k[:, :, start : start + count],
+                v[:, :, start : start + count],
+                start=start,
+                cache=cache,
+                window=window,
+                max_context=512,
+                prefill_chunk=128,
+            )
+        )
+        cache.key[:, :, cache.length :].fill_(float("nan"))
+        cache.value[:, :, cache.length :].fill_(float("nan"))
+    torch.testing.assert_close(
+        torch.cat(outputs, dim=-2), expected, rtol=1e-3, atol=1e-5
+    )
+    assert max(calls) > 4 and len(calls) < 35

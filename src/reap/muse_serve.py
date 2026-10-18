@@ -70,6 +70,7 @@ def create_app(
             "execution": "sequential layer placement; greedy; single request",
             "optimized": getattr(runtime, "optimized", False),
             "bounded_attention": getattr(runtime, "bounded_attention", False),
+            "prefill_chunk": getattr(runtime, "prefill_chunk", None),
         }
 
     @app.get("/v1/models")

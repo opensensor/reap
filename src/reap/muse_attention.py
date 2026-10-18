@@ -24,7 +24,7 @@ def bounded_attention(
     prefill_chunk=64,
     op=None,
 ):
-    """Bound grouped attention scores to at most 32 rows per KV head.
+    """Bound grouped attention workspace while batching short-prefix queries.
 
     Full-attention storage is allocated once per request, then appended in place.
     actual_seq_lengths excludes uninitialized capacity. Sliding caches retain
@@ -87,6 +87,14 @@ def bounded_attention(
     query_chunk = min(16, 32 // repeats)
     if query_chunk < 1:
         raise ValueError("GQA ratio exceeds the bounded score budget")
+    if use_grouped:
+        # At 96K, retain the proven four-query Muse tile. Short prefixes can
+        # batch more queries within the same score-element budget, avoiding
+        # dozens of tiny BMM/mask/softmax launches per prefill layer. Cap the
+        # budget independently of the configured context and keep injected
+        # operators on their existing, conservative geometry.
+        score_budget = 32 * min(max_context, 98304)
+        query_chunk = min(prefill_chunk, max(1, score_budget // (repeats * length)))
     outputs = []
     key_positions = torch.arange(key.shape[-2], device=q.device) + start - previous
     for first in range(0, count, query_chunk):

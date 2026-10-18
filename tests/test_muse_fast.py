@@ -33,7 +33,7 @@ def test_tile_encoding_preserves_every_weight_and_scale(n, k):
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
-@pytest.mark.parametrize("tokens", [1, 11])
+@pytest.mark.parametrize("tokens", [1, 7, 64, 257])
 def test_fast_moe_matches_independent_dequantized_experts(monkeypatch, tokens):
     torch.manual_seed(81)
     c = SimpleNamespace(
@@ -121,3 +121,24 @@ def test_tiled_split_k_matches_reference_partial_rounding(monkeypatch):
     expected = (parts[0] + parts[1]).half()
     torch.testing.assert_close(bank.linear(x, expert=1), expected, rtol=0, atol=0)
     assert len(calls) == 4 and max(shape[0] for shape in calls) == 128
+
+
+def test_stage_positions_reuse_only_identical_geometry_and_chunk():
+    from reap.muse_fast import StepPositions
+
+    cache = StepPositions()
+    c = SimpleNamespace(head_dim=64, rope_parameters={"rope_theta": 500000})
+    x = torch.empty(1, 128, 8192).half()
+    for start, count in ((0, 128), (128, 1), (98303, 1), (0, 7)):
+        values = cache.get(c, x, start, count)
+        assert cache.get(c, x, start, count) is values
+        positions, cos, sin = values
+        torch.testing.assert_close(positions, torch.arange(start, start + count))
+        inv = 1.0 / (500000 ** (torch.arange(0, 64, 2).float() / 64))
+        angles = positions[:, None].float() * inv
+        phase = torch.cat((angles, angles), -1)
+        torch.testing.assert_close(cos, phase.cos().half(), rtol=0, atol=0)
+        torch.testing.assert_close(sin, phase.sin().half(), rtol=0, atol=0)
+    c.rope_parameters["rope_theta"] = 10000
+    changed = cache.get(c, x, 0, 7)
+    assert not torch.equal(changed[1], values[1])

@@ -337,7 +337,7 @@ def placement_plan(
         or len(devices) > c.num_hidden_layers
         or max_context < 1
         or reserve_gib < 0
-        or not 1 <= prefill_chunk <= 128
+        or not 1 <= prefill_chunk <= (512 if optimized and bounded_attention else 128)
         or (bounded_attention and not optimized)
     ):
         raise ValueError("invalid placement request")
@@ -450,7 +450,7 @@ class MuseRuntime:
         if self.c.num_local_experts != self.journal["identity"]["plan"]["keep"]:
             raise ValueError("config expert count differs from export plan")
         if (
-            not 1 <= prefill_chunk <= 128
+            not 1 <= prefill_chunk <= (512 if optimized and bounded_attention else 128)
             or not 1 <= max_context <= self.c.max_position_embeddings
         ):
             raise ValueError("invalid context or prefill size")
@@ -494,6 +494,10 @@ class MuseRuntime:
                     )
         self.layers, self.globals = [], {}
         for item in self.plan:
+            if optimized:
+                from reap.muse_fast import StepPositions
+
+                positions = StepPositions()
             for i in range(item["first_layer"], item["last_layer_exclusive"]):
                 self.layers.append(
                     loader(
@@ -508,6 +512,8 @@ class MuseRuntime:
                 self.layers[-1].max_context = max_context
                 self.layers[-1].prefill_chunk = prefill_chunk
                 self.layers[-1].bounded_attention = bounded_attention
+                if optimized:
+                    self.layers[-1].positions = positions
                 progress(
                     json.dumps(
                         {"event": "loaded_layer", "layer": i, "device": item["device"]}
