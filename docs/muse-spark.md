@@ -1601,3 +1601,114 @@ its prefill took 83.391 seconds, and follow-ups reused 4,096/4,608 tokens.
 The generated lengths differ, so this is a functional integration result, not
 a controlled end-to-end speedup. It does **not** establish responsive Kilo use
 or broad coding quality. Only read/edit actions were exercised.
+
+### Peer allocation diagnosis and transport qualification (2026-10-19)
+
+Fresh-process probes reproduced the device 2 → 1 SDMA translation failure
+(`507013`) with ordinary allocation, and with expandable allocation plus
+successful explicit peer enablement in both directions. Device 2 → 0 also
+failed; 0 → 2 passed. Performing the successful reverse copy first did not
+repair 2 → 0. These failures do not establish that all peer links are unusable.
+
+A synchronous ACL copy exposed `devmm_d2d_pa_to_bar_dma`: the destination
+physical address could not be translated into its PCIe BAR (`-EFAULT`). The
+host driver's `devdrv_devmem_addr_d2h` rejects addresses outside the advertised
+RX ATU ranges. Allocating the destination with
+`ACL_MEM_MALLOC_HUGE_FIRST_P2P` instead of ordinary tensor storage made the
+2 → 0 asynchronous copy exact at 128 KiB and 4 MiB. No driver module change
+was needed for this test. Peer capability and successful enablement alone do
+not establish that an arbitrary tensor allocation is peer-addressable.
+
+The loaded model had exhausted P2P huge pages on the inspected devices;
+device 1 had only about 1.2 MB reported free in its P2P normal-page pool, and
+even a 128 KiB P2P allocation failed there. With the idle model unloaded,
+reserving a bounded 16 MiB arena on each device succeeded. All 36 directed
+source/destination combinations then passed four exact 128 KiB copies each:
+24 inter-card peer paths, six local paths and six same-card pinned-host
+fallbacks. The first arena probe required a correction to initialize ACL
+contexts before calling the native allocator; it stopped before any copy.
+
+The six-rank transport microbenchmark used 15 repetitions, discarded four
+warmups, and bracketed the candidate with host-transfer controls. Values below
+are means of the six owner devices' medians; they are not model throughput.
+
+| Operation | Rows × width | Host control | Peer candidate |
+| --- | --- | ---: | ---: |
+| Broadcast | 8 × 4096 | 0.488 ms | 0.515 ms |
+| Gather | 8 × 4096 | 0.440 ms | 0.602 ms |
+| Broadcast | 512 × 4096 | 1.274 ms | 2.105 ms |
+| Gather | 512 × 4096 | 1.031 ms | 0.669 ms |
+
+The peer path preserved every value but regressed decode-sized transfers and
+broadcasts. It is not enabled for serving. The large-gather result warrants a
+separate prefill experiment, with arenas reserved before loading weights and
+the same-card fallback retained. Current serving continues to use pinned-host
+transport. Evidence and standalone reproduction scripts are in
+`results/muse-opt-v14` and `runs/muse-opt-v14` beside the checkout, mirrored on
+Threadripper under `opt-v14`.
+
+The subsequent reload correctly stopped at a layer-55 cache integrity failure.
+Two cached reads agreed on the wrong hash, while a simultaneous `O_DIRECT`
+disk read matched the receipt. Comparing both paths identified exactly one
+changed byte and one changed bit: file offset 3,699,389,219 was `0x9c` in cache
+and `0x98` on disk. Both versions of the affected 4 KiB page were preserved.
+`POSIX_FADV_DONTNEED` followed by a fresh read restored the expected checksum;
+no file bytes or receipts were rewritten and no integrity check was bypassed.
+This is the second observed page-cache integrity incident, on a different layer
+from the earlier layer-21 event. Its cause remains unresolved; a one-bit change
+does not establish a DMA/driver fault or a RAM fault. The host exposes no EDAC
+memory-controller counters at the inspected sysfs path.
+
+### Constant-offset W4 specialization (2026-10-19)
+
+`629e5a1` adds `--offsets eight` to the native builder. The biased symmetric
+NZ layout represents zero as eight, so the specialized kernel replaces the
+per-group offset broadcasts with one tile-wide FP16 addition of negative eight.
+It omits offset loads/casts while preserving scale multiplication, Cube products,
+FP16 partial-product rounding and the ordered FP32 split-K sum.
+
+The separate `muse-w4-offset8-v1` ABI validates every offset tensor before its
+first native use. Validation retains tensor identity and rechecks versioned
+tensors after in-place changes. Inference tensors follow the runtime's existing
+immutable-weight contract. The original `muse-w4-v1` ABI still supports tensor
+offsets. Tests cover rejection before any native launch, changed offsets, valid
+inference tensors and the generic backend's unchanged behavior. The full prior
+suite plus the added integration test pass **155 tests**.
+
+The guarded candidate passed 21 operator shape/mode cases and 56 additional
+changing-input/route cases. A same-process full-model comparison then measured:
+
+| Measurement | Control before | Offset-eight kernel | Control after |
+| --- | ---: | ---: | ---: |
+| Short decode, median of three | 2.573 tok/s | **2.622 tok/s** | 2.569 tok/s |
+| Decode after 2,127 tokens | 2.429 tok/s | **2.471 tok/s** | 2.439 tok/s |
+| Cold 2,127-token prefill | 34.714 s | 34.432 s | 34.035 s |
+
+Short decode improves **1.97%** over the mean of the two control medians.
+Long-prompt decode improves about **1.51%**. Prefill is effectively unchanged:
+the candidate is 0.17% slower than the mean control, within the observed control
+variation. Every saved completion in the comparison matched exactly. The trial
+returned to the control before final qualification.
+
+Final qualification selected `muse_w4_v14_offset8_guarded_k1024` in the frozen
+`runtime-629e5a1` image. All 611 source/operator files verify, all 62 packed
+layers loaded from cache, and all 124 saved layer outputs match exactly. The
+selected launcher is `launch-muse-offset-v14.sh`; rollback uses
+`launch-muse-output-v13.sh`. The current worker was started with the control
+native and switched through the exact-logit gate; the launcher now selects the
+qualified offset-eight native for subsequent starts.
+
+The final short-decode median is **2.624 tok/s**. Cold 2,127-token prefill takes
+**33.753 seconds**, followed by **2.473 tok/s** decode; the repeated-prefix
+request takes **8.428 seconds** total. Cold 4,254-token prefill takes
+**73.506 seconds**, followed by **2.437 tok/s** decode; its repeated-prefix
+request takes **10.064 seconds**. These final measurements are separate from
+the paired controls above. Saved completions remain exact.
+
+Streaming returns 16 exact text chunks and reports 2,048 cached tokens on the
+warm request, with first text in **2.394 seconds**. Disconnect recovery and
+three recapture cycles pass. Both ports serve the same worker; all 151 host
+threads have CPU mask 0–63 after cleanup, storage identities are unchanged,
+and no new Ascend kernel errors were found since this reload. Context remains
+98,304 tokens. The actual Kilo read/edit smoke was not repeated in this round;
+its previous 232.586-second result remains the latest end-to-end evidence.
