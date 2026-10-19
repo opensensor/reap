@@ -1533,3 +1533,71 @@ The final idle check verified all 428 frozen files and both serving ports on
 worker 1154211. All 151 remaining threads had CPU mask 0–63; no new Ascend
 kernel errors were found since this reload. Resident weight storage identities
 were unchanged through the trials. No driver modules were replaced.
+
+### Vocabulary sharding and pinned rank results (2026-10-19)
+
+The next profile covers layers 0–3 in the 512-token chunk starting at position
+3,584 of a synthetic 4,254-token completion fixture. Unprofiled cold prefill
+controls took 74.507 and 73.962 seconds. Summed device durations included
+150.8 ms of W4 tasks and 75.0 ms of FP32 softmax; devices overlap, and blocking
+host copies include pending compute. FP16-output softmax and half-to-float
+softmax trials changed values, so neither replaces the existing FP32 path.
+
+`c061ea5` adds optional `--tensor-output` to the serving/deployment commands.
+Vocabulary rows are partitioned at 32-channel boundaries and loaded directly
+into six NZ matrices. The original owner matrix is omitted. Each rank keeps the
+existing FP16 projection, output multiplier and tanh softcap arithmetic. One
+ordered CPU gather returns independent logits, so later requests cannot overwrite
+a prefix snapshot. Decode captures the projections in the existing graph pools;
+all futures drain on failure and reset invalidates the head graphs. Resident
+storage identity includes every vocabulary shard.
+
+The memory planner redistributes the existing 3,310,354,432 head bytes; it adds
+no duplicate weight storage. Dense/KV stages become `0/4/15/26/38/50/62` while
+retaining 98,304-token context, 512-token prefill chunks and the 3 GiB reserve.
+The full 202,048-row hardware probe matched every logit at 1/4/7 tokens with
+changing inputs and recapture. Single-token projection plus CPU result transfer
+fell from approximately **16.6 ms to 3.3 ms**. This is an isolated head measurement,
+not a fivefold full-model speedup.
+
+The same commit copies prefill rank outputs directly into reusable pinned
+buffers. Each rank/phase/shard width retains one row count; gathers finish before
+reuse. Controlled cold 2,127-token prefill measured 34.021 / **33.513** / 34.004
+seconds (**1.49%** throughput gain). A 4,254-token follow-up with 2,048 cached
+tokens measured 42.381 / **41.818** / 42.417 seconds (**1.39%** gain). Short decode
+was 0.20% lower in that trial. All completion outputs matched. The CPU suite
+passes **153 tests**, including independent output lifetime, changed inputs,
+recapture, complete future draining, shard identity and exact placement totals.
+Evidence and scripts are under `../results/muse-opt-v13` and `../runs/muse-opt-v13`.
+
+The frozen serving image `runtime-c061ea5` contains 362 verified source/operator
+files and is launched by `launch-muse-output-v13.sh`. The native W4 backend remains
+`muse_w4_v12_rows_ordered_k1024`; the configured Python patch SHA256 is
+`df9ce19202fe49c45daceadfbf428e3cf32f19c0b8cec2934723527caaabdd2c`.
+All 62 packed layers loaded from cache without checksum failures. Every one of
+the 124 saved layer outputs matched exactly after the layout change.
+
+Final short-decode median was **2.568 tok/s**, versus the preceding same-fixture
+controls' 2.482/2.473 tok/s. This before/reload comparison includes both the head
+change and the new placement; it is separate from the isolated head benchmark.
+Cold 2,127-token prefill took **33.765 seconds**, decode was **2.447 tok/s**, and
+the 2,048-cached-token request took **8.533 seconds** total. Cold 4,254-token
+prefill took **73.460 seconds**, versus 74.507/73.962-second prior controls;
+decode was **2.424 tok/s**. Reusing 4,096 tokens reduced that request to
+**10.042 seconds** total. All completion text and usage checks passed.
+
+SSE returned the exact 16-token fixture, with cached first text in 2.435 seconds.
+Cached usage, disconnect recovery and three recapture cycles passed. The final
+idle check found both ports on worker 1246486, all 362 frozen files intact,
+all 151 host threads restored to CPU mask 0–63, unchanged resident storage
+identities during qualification, and no new Ascend kernel errors since startup.
+No driver modules were changed. Rollback remains `launch-muse-ordered-v12.sh`.
+
+The actual six-tool Kilo agent again completed read → edit → confirmation and
+an independent check of the edited function returned 5 for `add(2, 3)`.
+This run took **232.586 seconds** and generated 314 tokens, versus the previous
+222.768 seconds and 280 tokens. The initial prompt again contained 4,535 tokens;
+its prefill took 83.391 seconds, and follow-ups reused 4,096/4,608 tokens.
+The generated lengths differ, so this is a functional integration result, not
+a controlled end-to-end speedup. It does **not** establish responsive Kilo use
+or broad coding quality. Only read/edit actions were exercised.
