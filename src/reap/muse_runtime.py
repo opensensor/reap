@@ -315,9 +315,12 @@ def placement_plan(
     bounded_attention=False,
     prefill_chunk=64,
     tensor_experts=False,
+    tensor_attention=False,
     prefix_cache=False,
 ):
     """Minimax contiguous layer placement, including globals and bounded KV."""
+    if tensor_attention and not tensor_experts:
+        raise ValueError("tensor attention requires tensor experts")
     if prefix_cache and not bounded_attention:
         raise ValueError("prefix cache requires bounded attention")
     root = Path(root)
@@ -439,6 +442,7 @@ def placement_plan(
             prefill_chunk,
             reserve_gib,
             prefix_cache=prefix_cache,
+            tensor_attention=tensor_attention,
         )
     return stages
 
@@ -458,6 +462,7 @@ class MuseRuntime:
         bounded_attention=False,
         packed_cache=None,
         tensor_experts=False,
+        tensor_attention=False,
         prefix_cache=False,
     ):
         self.root = Path(root)
@@ -485,12 +490,17 @@ class MuseRuntime:
         self.max_context, self.prefill_chunk = max_context, prefill_chunk
         self.optimized = optimized
         self.tensor_experts = tensor_experts
+        self.tensor_attention = tensor_attention
         self.prefix_cache_enabled = prefix_cache
         self.execution = (
-            "tensor-parallel experts; sequential dense stages"
-            if tensor_experts
-            else "sequential layer placement"
-        ) + "; greedy; single request"
+            (
+                "tensor-parallel experts; sequential dense stages"
+                if tensor_experts
+                else "sequential layer placement"
+            )
+            + ("; sharded query/gate" if tensor_attention else "")
+            + "; greedy; single request"
+        )
         if packed_cache is not None and not optimized:
             raise ValueError("packed cache requires optimized mode")
         self.bounded_attention = bounded_attention
@@ -508,6 +518,7 @@ class MuseRuntime:
             prefill_chunk=prefill_chunk,
             tensor_experts=tensor_experts,
             prefix_cache=prefix_cache,
+            tensor_attention=tensor_attention,
         )
         loader = load_layer
         if optimized:
@@ -555,7 +566,13 @@ class MuseRuntime:
                         verify=verify,
                         packed_cache=packed_cache,
                     )
-                    layer = shard_layer(cpu, devices, item["device"], self.expert_pool)
+                    layer = shard_layer(
+                        cpu,
+                        devices,
+                        item["device"],
+                        self.expert_pool,
+                        tensor_attention=tensor_attention,
+                    )
                     del cpu
                     self.resident_layers.extend(layer.tensor_experts.ranks)
                 else:

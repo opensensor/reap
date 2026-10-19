@@ -317,3 +317,44 @@ def test_rank_pool_keeps_each_device_on_one_distinct_host_thread():
         assert all(row == visits[0] for row in visits)
     finally:
         pool.shutdown()
+
+
+def test_attention_sharding_memory_plan_conserves_total_and_reserve():
+    from reap.muse_tensor import tensor_plan
+    from reap.muse_dense import QG_NAMES
+    from reap.muse_runtime import PREFIX
+
+    c = SimpleNamespace(
+        num_hidden_layers=6,
+        moe_hidden_size=768,
+        moe_intermediate_size=768,
+        sliding_window=128,
+        num_key_value_heads=2,
+        head_dim=64,
+        layer_types=["full_attention"] * 6,
+    )
+    shards = {}
+    for i in range(6):
+        weights = {}
+        for name in QG_NAMES:
+            key = f"{PREFIX}layers.{i}.{name}"
+            weights[key] = {"bytes": 224 * 64, "shape": [224, 64]}
+            weights[key + "_scale"] = {"bytes": 224 * 4, "shape": [224, 1]}
+        shards[f"dense-{i:03d}.safetensors"] = {"tensors": weights}
+        for ep in range(2):
+            shards[f"experts-{i:03d}-ep{ep}.safetensors"] = {"tensors": {}}
+    stages = [dict(device=f"npu:{i}") for i in range(6)]
+    base = tensor_plan(c, {"shards": shards}, stages, 98304, 512, 3)
+    sharded = tensor_plan(
+        c, {"shards": shards}, stages, 98304, 512, 3, tensor_attention=True
+    )
+    assert sum(v["required_bytes"] for v in base) == sum(
+        v["required_bytes"] for v in sharded
+    )
+    assert sum(v["attention_shard_bytes"] for v in sharded) == 6 * 2 * 224 * 64 * 2
+    assert all(
+        v["required_bytes"] - v["weights_and_kv_bytes"] == 3 * 2**30 for v in sharded
+    )
+    assert [v["attention_shard_bytes"] for v in sharded] == [
+        6 * 2 * n * 64 * 2 for n in [64, 32, 32, 32, 32, 32]
+    ]

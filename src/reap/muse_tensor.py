@@ -214,12 +214,16 @@ class TensorExperts:
         return host_inputs.to(device)
 
 
-def shard_layer(cpu, devices, owner, pool, *, decode_graphs=True):
+def shard_layer(
+    cpu, devices, owner, pool, *, decode_graphs=True, tensor_attention=False
+):
     if (
         cpu.gate_up.outputs != 2 * cpu.down.inputs
         or cpu.gate_up.inputs != cpu.down.outputs
     ):
         raise ValueError("unsupported expert projection geometry")
+    from reap.muse_dense import QG_NAMES, TensorAttention
+
     gate_ranges = partitions(cpu.down.inputs, len(devices), cpu.index)
     down_ranges = partitions(cpu.down.outputs, len(devices), cpu.index)
     ranks = []
@@ -233,6 +237,7 @@ def shard_layer(cpu, devices, owner, pool, *, decode_graphs=True):
             weights = {
                 name: native_weight(value.clone(), device)
                 for name, value in cpu.w.items()
+                if not tensor_attention or name not in QG_NAMES
             }
             layer = FastMuseLayer(cpu.c, cpu.index, weights, gate_up, down)
             rank = layer
@@ -244,6 +249,8 @@ def shard_layer(cpu, devices, owner, pool, *, decode_graphs=True):
     if str(owner) not in [str(d) for d in devices]:
         raise ValueError("dense owner is not a tensor rank")
     layer.tensor_experts = TensorExperts(ranks, pool, decode_graphs=decode_graphs)
+    if tensor_attention:
+        layer.tensor_attention = TensorAttention.from_layer(cpu, layer.tensor_experts)
     return layer
 
 
@@ -289,6 +296,7 @@ def tensor_plan(
     reserve_gib,
     *,
     prefix_cache=False,
+    tensor_attention=False,
 ):
     """Account for every shard, dense NZ matrix, KV slot, and global tensor."""
     from reap.muse_runtime import PREFIX
@@ -297,6 +305,7 @@ def tensor_plan(
     dense = [0] * config.num_hidden_layers
     globals_ = [0] * ranks
     experts = [0] * ranks
+    attention = [0] * ranks
     for index in range(config.num_hidden_layers):
         tensors = journal["shards"][f"dense-{index:03d}.safetensors"]["tensors"]
         dense[index] += sum(t["bytes"] for t in tensors.values())
@@ -305,6 +314,18 @@ def tensor_plan(
                 dense[index] += (
                     tensors[name.removesuffix("_scale")]["bytes"] - record["bytes"]
                 )
+        if tensor_attention:
+            from reap.muse_dense import QG_NAMES
+
+            for name in QG_NAMES:
+                key = f"{PREFIX}layers.{index}.{name}"
+                record = tensors[key]
+                rows, columns = record["shape"]
+                # Dense W8 codes/scales have already been counted as FP16.
+                cost = rows * columns * 2
+                dense[index] -= cost
+                for r, (lo, hi) in enumerate(partitions(rows, ranks, alignment=32)):
+                    attention[r] += (hi - lo) * columns * 2
         tokens = (
             min(max_context, config.sliding_window - 1 + prefill_chunk)
             if config.layer_types[index] == "sliding_attention"
@@ -344,7 +365,12 @@ def tensor_plan(
             for begin in range(rank, end):
                 if (rank, begin) not in dp:
                     continue
-                cost = sum(dense[begin:end]) + globals_[rank] + experts[rank]
+                cost = (
+                    sum(dense[begin:end])
+                    + globals_[rank]
+                    + experts[rank]
+                    + attention[rank]
+                )
                 peak, ranges = dp[rank, begin]
                 candidates.append((max(peak, cost), ranges + [(begin, end, cost)]))
             if candidates:
@@ -356,6 +382,7 @@ def tensor_plan(
             first_layer=begin,
             last_layer_exclusive=end,
             expert_shard_bytes=experts[r],
+            attention_shard_bytes=attention[r],
             dense_and_kv_bytes=cost - experts[r],
             weights_and_kv_bytes=cost,
             required_bytes=cost + int(reserve_gib * 2**30),

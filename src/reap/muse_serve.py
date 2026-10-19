@@ -524,6 +524,7 @@ def main():
     parser.add_argument("--served-model-name")
     parser.add_argument("--optimized", action="store_true")
     parser.add_argument("--tensor-experts", action="store_true")
+    parser.add_argument("--tensor-attention", action="store_true")
     parser.add_argument("--deterministic", action="store_true")
     parser.add_argument("--bounded-attention", action="store_true")
     parser.add_argument("--prefix-cache", action="store_true")
@@ -582,6 +583,7 @@ def main():
         bounded_attention=args.bounded_attention,
         packed_cache=args.packed_cache,
         tensor_experts=args.tensor_experts,
+        tensor_attention=args.tensor_attention,
         prefix_cache=args.prefix_cache,
     )
     torch.set_num_threads(1 if args.tensor_experts else 2)

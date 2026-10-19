@@ -97,10 +97,14 @@ def retained_linear(self, x, *, expert=None, ids=None, ends=None):
     return result
 
 
-def attention_qkv(self, x, phase):
+def attention_qkv(self, x, phase, query=None):
     c = self.c
     q, k, v = [
-        self.linear("self_attn." + name + "_proj", x)
+        (
+            query
+            if name == "q" and query is not None
+            else self.linear("self_attn." + name + "_proj", x)
+        )
         .view(1, 1, -1, c.head_dim)
         .transpose(1, 2)
         for name in ("q", "k", "v")
@@ -183,13 +187,32 @@ def fused_layer(self, x, start=0, cache=None):
             else x.new_empty(0)
         )
 
-    def inputs(value, phase):
-        normalized = self.norm("input_layernorm", value)
-        return normalized, *attention_qkv(self, normalized, phase)
+    attention_gate = None
+    if hasattr(self, "tensor_attention"):
+        if "layer-normalized" not in graphs:
+            graphs["layer-normalized"] = DecodeGraph.capture(
+                lambda value, _: self.norm("input_layernorm", value), x, phase
+            )
+        norm_graph = graphs["layer-normalized"]
+        normalized = norm_graph.run(x, norm_graph.routes)
+        qg = self.tensor_attention.project(normalized)
 
-    if "layer-inputs" not in graphs:
-        graphs["layer-inputs"] = DecodeGraph.capture(inputs, x, phase)
-    normalized, q, k, v = graphs["layer-inputs"].run(x, phase)
+        def inputs(value, phase):
+            query, gate = value.chunk(2, dim=-1)
+            return *attention_qkv(self, normalized, phase, query), torch.sigmoid(gate)
+
+        if "layer-inputs" not in graphs:
+            graphs["layer-inputs"] = DecodeGraph.capture(inputs, qg, phase)
+        q, k, v, attention_gate = graphs["layer-inputs"].run(qg, phase)
+    else:
+
+        def inputs(value, phase):
+            normalized = self.norm("input_layernorm", value)
+            return normalized, *attention_qkv(self, normalized, phase)
+
+        if "layer-inputs" not in graphs:
+            graphs["layer-inputs"] = DecodeGraph.capture(inputs, x, phase)
+        normalized, q, k, v = graphs["layer-inputs"].run(x, phase)
     attended = bounded_attention(
         q,
         k,
@@ -204,7 +227,12 @@ def fused_layer(self, x, start=0, cache=None):
     )
 
     def middle(attended, residual):
-        h = original_attention_output(self, attended, normalized)
+        if attention_gate is None:
+            h = original_attention_output(self, attended, normalized)
+        else:
+            attended = attended.transpose(1, 2).contiguous()
+            attended = self.fast_rms(attended, self.c.rms_norm_eps).reshape(1, 1, -1)
+            h = self.linear("self_attn.o_proj", attended * attention_gate)
         alpha, beta = self.residual_coefficients["post_attention"]
         residual = (
             alpha * residual + beta * self.fast_rms(h, self.c.post_norm_eps)

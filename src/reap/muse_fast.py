@@ -184,9 +184,16 @@ class FastMuseLayer(MuseLayer):
         return self.fast_rms(x, self.c.rms_norm_eps, weight)
 
     def attention_inputs(self, x, start):
+        return self.attention_qkv(x, start)
+
+    def attention_qkv(self, x, start, query=None):
         c, count = self.c, x.shape[1]
         q, k, v = [
-            self.linear("self_attn." + name + "_proj", x)
+            (
+                query
+                if name == "q" and query is not None
+                else self.linear("self_attn." + name + "_proj", x)
+            )
             .view(1, count, -1, c.head_dim)
             .transpose(1, 2)
             for name in ("q", "k", "v")
@@ -206,11 +213,16 @@ class FastMuseLayer(MuseLayer):
         return q, k, v, positions
 
     def attention_output(self, attended, x):
+        return self.attention_gated_output(
+            attended, x, self.linear("self_attn.gate_proj", x)
+        )
+
+    def attention_gated_output(self, attended, x, gate):
         attended = attended.transpose(1, 2).contiguous()
         attended = self.fast_rms(attended, self.c.rms_norm_eps).reshape(
             1, x.shape[1], -1
         )
-        attended = attended * torch.sigmoid(self.linear("self_attn.gate_proj", x))
+        attended = attended * torch.sigmoid(gate)
         return self.linear("self_attn.o_proj", attended)
 
     def __call__(self, x, start=0, cache=None):
@@ -231,7 +243,11 @@ class FastMuseLayer(MuseLayer):
             return super().attention(x, start, cache)
         from reap.muse_attention import bounded_attention
 
-        q, k, v, _ = self.attention_inputs(x, start)
+        if hasattr(self, "tensor_attention"):
+            query, gate = self.tensor_attention.project(x).chunk(2, dim=-1)
+            q, k, v, _ = self.attention_qkv(x, start, query)
+        else:
+            q, k, v, _ = self.attention_inputs(x, start)
         attended = bounded_attention(
             q,
             k,
@@ -244,6 +260,8 @@ class FastMuseLayer(MuseLayer):
             max_context=self.max_context,
             prefill_chunk=self.prefill_chunk,
         )
+        if hasattr(self, "tensor_attention"):
+            return self.attention_gated_output(attended, x, gate)
         return self.attention_output(attended, x)
 
     def expert_projection(self, routes, *, ids=None, ends=None):

@@ -53,6 +53,8 @@ class Resident:
         tensors = list(self.runtime.globals.items())
         for i, layer in enumerate(self.layers):
             tensors.extend((f"{i}.{name}", value) for name, value in layer.w.items())
+            if hasattr(layer, "attention_qg_weight"):
+                tensors.append((f"{i}.attention_qg", layer.attention_qg_weight))
             for name in ("gate_up", "down"):
                 for p, part in enumerate(getattr(layer, name).parts):
                     tensors.extend(
