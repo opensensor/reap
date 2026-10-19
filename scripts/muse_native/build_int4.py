@@ -35,12 +35,45 @@ def direct_quantizer(text):
     )
 
 
+def balanced_groups(text):
+    """Rotate grouped output tiles across cores, retaining each tile's math."""
+    start = "  __aicore__ inline void Process() {"
+    end = "\n private:"
+    if text.count(start) != 1 or text.count(end) != 1:
+        raise ValueError("unexpected Qwen grouped schedule scope")
+    before, body = text.split(start)
+    body, after = body.split(end)
+    anchors = (
+        (
+            "    int64_t previousEnd = 0;",
+            "    int64_t previousEnd = 0;\n    int64_t tileOffset = 0;",
+        ),
+        (
+            "      for (int64_t tile = GetBlockIdx(); tile < n_ / N; tile += GetBlockNum()) {",
+            "      const int64_t firstTile = (GetBlockIdx() + GetBlockNum() - tileOffset % GetBlockNum()) % GetBlockNum();\n"
+            "      for (int64_t tile = firstTile; tile < n_ / N; tile += GetBlockNum()) {",
+        ),
+        (
+            "      }\n    }\n  }\n",
+            "      }\n      tileOffset += (n_ / N) * ((end - begin + M - 1) / M);\n    }\n  }\n",
+        ),
+    )
+    for old, new in anchors:
+        if body.count(old) != 1:
+            raise ValueError("unexpected Qwen grouped schedule anchor")
+        body = body.replace(old, new)
+    return before + start + body + end + after
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--qwen-source", type=Path, required=True)
     p.add_argument("--cann", type=Path, required=True)
     p.add_argument("--output", type=Path, required=True)
     p.add_argument("--namespace", default="muse_a8_v1")
+    p.add_argument(
+        "--schedule", choices=("baseline", "balanced", "wide"), default="baseline"
+    )
     args = p.parse_args()
     if not re.fullmatch(r"muse_a8_[a-zA-Z0-9_]+", args.namespace):
         p.error("namespace must start muse_a8_ and contain identifier characters")
@@ -58,7 +91,8 @@ def main():
     inputs.mkdir()
     for name in ("compile_reconstruction.cpp", "reconstruction_bridge.cpp"):
         shutil.copy2(root / "tools/glm_perf" / name, inputs / name)
-    shutil.copy2(Path(__file__).with_name("native_a8.cpp"), inputs / "native_a8.cpp")
+    entry = "native_a8_wide.cpp" if args.schedule == "wide" else "native_a8.cpp"
+    shutil.copy2(Path(__file__).with_name(entry), inputs / "native_a8.cpp")
     kernel_root = root / "csrc/gmm/qwen_w4_a8_int4_matmul_v310/op_kernel"
     for name in (
         "native_int4_schedule.h",
@@ -67,6 +101,8 @@ def main():
     ):
         text = (kernel_root / name).read_text()
         if name == "native_int4_schedule.h":
+            if args.schedule != "baseline":
+                text = balanced_groups(text)
             text = zero_offsets(text)
         (inputs / name).write_text(text)
     quantizer = (
@@ -160,6 +196,7 @@ def main():
         json.dumps(
             dict(
                 commands=commands,
+                schedule=args.schedule,
                 manifest=manifest,
                 torch=torch.__version__,
                 torch_npu=torch_npu.__version__,

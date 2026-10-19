@@ -218,6 +218,43 @@ def test_direct_builder_refuses_changed_upstream_anchors():
             builder["direct_quantizer"](text)
 
 
+def test_balanced_builder_rejects_drift_and_preserves_routed_schedule():
+    import runpy
+    from pathlib import Path
+
+    transform = runpy.run_path(
+        str(Path(__file__).parents[1] / "scripts/muse_native/build_int4.py")
+    )["balanced_groups"]
+    source = """  __aicore__ inline void Process() {
+    int64_t previousEnd = 0;
+    for (int64_t expert = 0; expert < experts_; ++expert) {
+      for (int64_t tile = GetBlockIdx(); tile < n_ / N; tile += GetBlockNum()) {
+        Project(expert, tile, row, count);
+      }
+    }
+  }
+
+ private:
+  void ProcessRoutes() {
+    for (int64_t tile = GetBlockIdx(); tile < n_ / N; tile += GetBlockNum()) {
+      Project(expert, tile, row, count);
+    }
+  }
+"""
+    changed = transform(source)
+    assert changed.split(" private:")[1] == source.split(" private:")[1]
+    assert changed.count("Project(expert, tile, row, count);") == 2
+    assert "tileOffset +=" in changed
+    for invalid in (
+        source + source,
+        source.replace("previousEnd = 0", "previousEnd = -1"),
+        source.replace("tile < n_ / N", "tile <= n_ / N"),
+        changed,
+    ):
+        with pytest.raises(ValueError, match="grouped schedule"):
+            transform(invalid)
+
+
 def test_a8_plan_matches_actual_sharded_allocations_and_preserves_kv(monkeypatch):
     from reap.muse_fast import TiledBank
     from reap.muse_runtime import placement_plan

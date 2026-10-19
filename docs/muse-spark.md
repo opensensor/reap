@@ -1930,3 +1930,46 @@ All 182 Muse tests pass with the serving/cache changes, including A8 native
 qualification, Python-only backend retention, mixed-backend rejection and
 failed-switch rollback. Full cached serving validation is run separately on
 the six NPUs.
+
+
+The v18 cached server loaded all 62 native A8 entries with successful hash
+verification and passed its startup prefill/decode exact-logit gate. The
+supervisor observed readiness 330.0 seconds after starting the server process
+(including startup qualification and readiness polling). Completion and SSE
+outputs match the offline A8 trial for short and 4,254-token prompts; a real
+`read_file` call and resident reset/recapture also pass. Both ports share the
+A8 worker, with 98,304 context and the existing tool protocol. Kilo retains the
+model ID for compatibility and now displays W4A8.
+
+`build_int4.py --schedule wide` selects geometry-specific Qwen tiles: routed
+N=352/336 and grouped N=176/192 for Muse's padded shard widths. Grouped tiles
+rotate across cores. `--schedule balanced` keeps the 64-column geometry with
+the grouped rotation, while the default `baseline` preserves the previous
+schedule. The wide wrapper, transformed header and quantizer reproduce the
+hardware-tested build inputs byte for byte. The builder rejects changed or
+already-transformed upstream anchors.
+
+Both candidates matched A8v2 in 32 shape/distribution cases across N=672/704/
+1344/1408 and 8/137/512/4096 rows, including uneven groups, empty groups and
+trailing rows. An initial 320 changing graph replays passed, followed by 640
+replays during the timed comparison. Unique-route wide decode graphs were
+1.78–2.34 times faster; uniformly grouped 4,096-row projections were 1.22–1.49
+times faster. Highly skewed down projections regressed about 8%, which is why
+full-model measurements remain the deciding gate. No concurrent HTTP generation
+was detected during these isolated timings.
+
+The full-model before/wide/after medians were **3.132/3.458/3.127 tok/s** for
+short decode and **2.888/3.192/2.896 tok/s** after the 4,254-token prompt. Cold
+prefill took **75.766/68.110/75.584 seconds**, one cold measurement per arm.
+This is approximately 10.5% faster short decode, 10.4% faster long-prompt decode
+and 10.0% lower cold-prefill latency against the bracketing controls. All 18
+generations matched exactly; activation uses the full-logit and storage gates.
+The full 182-test suite passed for the A8 serving/cache implementation, and the
+21 adapter/builder tests pass after adding the schedule transformation.
+
+The v17 profiler had incomplete device coverage: prefill contained kernels only
+from NPU0, and decode missed the first token's earlier layers on NPUs1–5. The
+missing launch counts exactly match their dense-stage starting offsets. New
+profiling explicitly activates every device inside the capture and verifies
+per-device kernel counts before treating a trace as a complete breakdown.
+Profiler timings are kept separate from the clean throughput measurements.
