@@ -178,3 +178,95 @@ def test_attention_prefill_and_cached_decode_without_owner_qg(rope):
                 start += count
     finally:
         pool.shutdown()
+
+
+def test_affinity_override_validates_all_masks_and_restores_threads(monkeypatch):
+    import os
+    import threading
+    from pathlib import Path
+
+    scope = {}
+    exec(
+        (
+            Path(__file__).parents[1]
+            / "scripts/muse_resident_patches/layer_decode_graphs.py"
+        ).read_text(),
+        scope,
+    )
+    masks = {i: set(range(8)) for i in range(7)}
+    monkeypatch.setattr(os, "sched_getaffinity", lambda tid: masks[tid].copy())
+    monkeypatch.setattr(
+        os, "sched_setaffinity", lambda tid, cpus: masks.__setitem__(tid, set(cpus))
+    )
+    monkeypatch.setattr(threading, "get_native_id", lambda: 6)
+    pool = SimpleNamespace(
+        workers=[
+            SimpleNamespace(_threads=[SimpleNamespace(native_id=i)]) for i in range(6)
+        ]
+    )
+    experts = SimpleNamespace(pool=pool)
+    bind = scope["bind_rank_threads"]
+    with pytest.raises(ValueError, match="outside original"):
+        bind(experts, (0, 1, 2, 3, 4, 5, 8))
+    assert all(v == set(range(8)) for v in masks.values())
+    bind(experts, tuple(range(7)))
+    assert all(v == {i} for i, v in masks.items())
+    bind(experts, tuple(range(7)))
+    bind(experts, ())
+    assert all(v == set(range(8)) for v in masks.values())
+    assert pool._muse_affinity_original == {}
+
+
+def test_affinity_syscall_failure_restores_already_changed_masks(monkeypatch):
+    import os
+    import threading
+    from pathlib import Path
+
+    scope = {}
+    exec(
+        (
+            Path(__file__).parents[1]
+            / "scripts/muse_resident_patches/layer_decode_graphs.py"
+        ).read_text(),
+        scope,
+    )
+    masks = {i: set(range(8)) for i in range(7)}
+
+    def apply(tid, cpus):
+        if tid == 3 and len(cpus) == 1:
+            raise OSError("injected affinity failure")
+        masks[tid] = set(cpus)
+
+    monkeypatch.setattr(os, "sched_getaffinity", lambda tid: masks[tid].copy())
+    monkeypatch.setattr(os, "sched_setaffinity", apply)
+    monkeypatch.setattr(threading, "get_native_id", lambda: 6)
+    pool = SimpleNamespace(
+        workers=[
+            SimpleNamespace(_threads=[SimpleNamespace(native_id=i)]) for i in range(6)
+        ]
+    )
+    with pytest.raises(OSError, match="injected affinity"):
+        scope["bind_rank_threads"](SimpleNamespace(pool=pool), tuple(range(7)))
+    assert all(v == set(range(8)) for v in masks.values())
+
+
+def test_affinity_applies_only_to_decode_and_restores_prefill():
+    from pathlib import Path
+
+    scope = {}
+    exec(
+        (
+            Path(__file__).parents[1]
+            / "scripts/muse_resident_patches/layer_decode_graphs.py"
+        ).read_text(),
+        scope,
+    )
+    visits = []
+    scope["CPU_AFFINITY"] = tuple(range(7))
+    scope["bind_rank_threads"] = lambda experts, cpus: visits.append(cpus)
+    scope["original_call"] = lambda self, x, start, cache: x
+    layer = SimpleNamespace(index=0, tensor_experts=object(), bounded_attention=False)
+    for count in (7, 1, 1, 512):
+        x = torch.zeros(1, count, 16)
+        assert scope["fused_layer"](layer, x) is x
+    assert visits == [(), tuple(range(7)), tuple(range(7)), ()]

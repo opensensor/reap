@@ -8,6 +8,52 @@ from reap.muse_tensor import DecodeGraph
 original_moe = getattr(FastMuseLayer.moe, "_muse_original", FastMuseLayer.moe)
 
 
+# Optional decode override: one CPU per rank, then the inference thread.
+# Append CPU_AFFINITY = (...) to a frozen copy; empty restores saved masks.
+CPU_AFFINITY = ()
+
+
+def bind_rank_threads(experts, cpus):
+    import os
+    import threading
+
+    pool = getattr(experts, "pool", None)
+    saved = getattr(pool, "_muse_affinity_original", {})
+    if not cpus and not saved:
+        return
+    if pool is None:
+        raise ValueError("CPU affinity requires a tensor rank pool")
+    threads = [next(iter(worker._threads)).native_id for worker in pool.workers]
+    threads.append(threading.get_native_id())
+    if cpus and (len(cpus) != len(threads) or len(set(cpus)) != len(cpus)):
+        raise ValueError("CPU affinity requires one distinct CPU per rank and caller")
+    # Validate every target before changing any mask. Keep the initial masks so
+    # disabling the override restores all inference threads used by either port.
+    current, desired = {}, {}
+    for tid in threads if cpus else saved:
+        try:
+            current[tid] = os.sched_getaffinity(tid)
+        except ProcessLookupError:
+            if cpus:
+                raise
+            continue
+        saved.setdefault(tid, current[tid])
+        desired[tid] = {cpus[threads.index(tid)]} if cpus else saved[tid]
+        if not desired[tid].issubset(saved[tid]):
+            raise ValueError("requested CPU outside original thread affinity")
+    changed = []
+    try:
+        for tid, mask in desired.items():
+            if current[tid] != mask:
+                os.sched_setaffinity(tid, mask)
+                changed.append(tid)
+    except BaseException:
+        for tid in reversed(changed):
+            os.sched_setaffinity(tid, current[tid])
+        raise
+    pool._muse_affinity_original = saved if cpus else {}
+
+
 def prepare(self, x, unused):
     c = self.c
     flat = x.reshape(-1, x.shape[-1])
@@ -164,6 +210,11 @@ original_call = getattr(
 
 
 def fused_layer(self, x, start=0, cache=None):
+    if self.index == 0 and hasattr(self, "tensor_experts"):
+        bind_rank_threads(
+            self.tensor_experts,
+            CPU_AFFINITY if x.ndim == 3 and x.shape[1] == 1 else (),
+        )
     if x.ndim != 3 or x.shape[0] != 1 or x.shape[1] != 1 or start < 0:
         return original_call(self, x, start, cache)
     if not hasattr(self, "tensor_experts") or not getattr(
