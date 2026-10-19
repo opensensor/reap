@@ -106,6 +106,39 @@ def order_tile_reuse(text):
     return text.replace(before, after)
 
 
+def constant_offsets(text):
+    """Specialize biased symmetric NZ weights; the offset8 ABI validates inputs."""
+    anchor = "constexpr uint8_t repeats = groupElements / QW4_HALF_VECTOR_ELEMENTS;"
+    if text.count(anchor) != 1:
+        raise ValueError("unexpected upstream tiled metadata broadcast")
+    first = text.index(
+        "      for (int32_t field = 0; field < codesPerByte_; ++field) {",
+        text.index(anchor),
+    )
+    last = text.index("      // Groups/fields are disjoint.", first)
+    block = text[first:last]
+    if block.count("Sub(values, values, offsetHalfUB_[base],") != 1:
+        raise ValueError("unexpected upstream offset subtraction")
+    text = (
+        text[:first]
+        + "      Adds(signedHalfUB_, signedHalfUB_, static_cast<half>(-8), "
+        "static_cast<int32_t>(decodedTileCount_));\n" + text[last:]
+    )
+    before = "    DataCopy(offsetUB_, offsetGm_[static_cast<int64_t>(n0) * kbCount_], metadataCount);"
+    if text.count(before) != 1:
+        raise ValueError("unexpected upstream offset load")
+    text = text.replace(before, "    if (!tiled_)" + before[3:])
+    before = (
+        "      Cast(offsetHalfUB_, offsetUB_, RoundMode::CAST_NONE, metadataCount);\n"
+        "      PipeBarrier<PIPE_V>();"
+    )
+    if text.count(before) != 1:
+        raise ValueError("unexpected upstream offset cast")
+    return text.replace(
+        before, "      // Offset8 ABI: no per-group offset load or cast."
+    )
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--qwen-source", type=Path, required=True)
@@ -115,6 +148,7 @@ def main():
     p.add_argument("--namespace", default="muse_w4_v1")
     p.add_argument("--tile", type=int, choices=(512, 1024), default=1024)
     p.add_argument("--unpack", choices=("arithmetic", "mask"), default="arithmetic")
+    p.add_argument("--offsets", choices=("tensor", "eight"), default="tensor")
     args = p.parse_args()
     if not re.fullmatch(r"muse_w4_[a-zA-Z0-9_]+", args.namespace):
         p.error("namespace must start muse_w4_ and contain only identifier characters")
@@ -147,6 +181,8 @@ def main():
             if args.unpack == "mask":
                 text = mask_unpack(text)
             text = order_tile_reuse(text)
+            if args.offsets == "eight":
+                text = constant_offsets(text)
         (inputs / name).write_text(text)
     commands = []
 
@@ -227,7 +263,7 @@ def main():
         name=f"{args.namespace}_k{args.tile}",
         namespace=args.namespace,
         tile=args.tile,
-        abi="muse-w4-v1",
+        abi="muse-w4-offset8-v1" if args.offsets == "eight" else "muse-w4-v1",
         library=dict(path=str(library), sha256=digest(library)),
         kernel=dict(path=str(binary), sha256=digest(binary)),
     )
@@ -238,6 +274,7 @@ def main():
     )
     receipt = dict(
         unpack=args.unpack,
+        offsets=args.offsets,
         commands=commands,
         torch=torch.__version__,
         torch_npu=torch_npu.__version__,

@@ -18,7 +18,7 @@ def check_manifest(value):
         not re.fullmatch(r"muse_w4_[a-zA-Z0-9_]+", value["namespace"])
         or not re.fullmatch(r"[a-zA-Z0-9_-]+", value["name"])
         or value["tile"] not in (512, 1024)
-        or value["abi"] != "muse-w4-v1"
+        or value["abi"] not in ("muse-w4-v1", "muse-w4-offset8-v1")
     ):
         raise ValueError("unsupported native manifest")
     for name in ("library", "kernel"):
@@ -33,6 +33,7 @@ class NativeW4:
     def __init__(self, manifest, devices):
         self.manifest = manifest
         self.kernels, self.scratch, self.geometry = {}, {}, OrderedDict()
+        self.validated_offsets = {}
         namespace = manifest["namespace"]
         torch.ops.load_library(manifest["library"]["path"])
         self.launch = getattr(getattr(torch.ops, namespace), "launch")
@@ -84,6 +85,8 @@ class NativeW4:
                 or any(t.device != x.device or not t.is_contiguous() for t in (q, s, o))
             ):
                 raise ValueError("invalid native bank ABI")
+            if self.manifest["abi"] == "muse-w4-offset8-v1":
+                self.require_offset8(o)
             current = x[:, part * 2048 : part * 2048 + k].contiguous()
             key = (x.device, len(x), n, k, e, int(ends is not None))
             if key not in self.geometry:
@@ -103,3 +106,22 @@ class NativeW4:
             result = result.float()
             accumulator = result if accumulator is None else accumulator + result
         return accumulator.to(x.dtype)
+
+    def require_offset8(self, offsets):
+        # Weights are immutable during serving. Validate before warmup/capture,
+        # retain the tensor so recycled addresses cannot inherit validation,
+        # and revalidate versioned tensors after an in-place modification.
+        # Inference tensors have no version counter and share the runtime's
+        # existing immutable-weight contract.
+        try:
+            version = offsets._version
+        except RuntimeError:
+            version = None
+        previous = self.validated_offsets.get(id(offsets))
+        if previous is not None and previous[0] is offsets and previous[1] == version:
+            return
+        if not bool(torch.all(offsets == 8).item()):
+            raise ValueError(
+                "offset8 native ABI requires every weight offset to be eight"
+            )
+        self.validated_offsets[id(offsets)] = offsets, version
