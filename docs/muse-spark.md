@@ -1366,3 +1366,102 @@ The current process retains the `8dc6f8f` load-time layout and hot-loads this pa
 **141 tests**. Trace CSVs and summaries are in `../results/muse-opt-v10/trace-prefill`;
 controlled trials are `reuse-prefill-performance.json`,
 `direct-prefill-performance.json` and `final-performance.json`.
+
+### Fine expert partitions and affinity cleanup (2026-10-18)
+
+`ce9b4aa` partitions expert outputs at the physical 32-channel NZ boundary.
+For six ranks and 4,096 channels, the widest shard falls from 768 to 704
+channels; the other four shards have 672 channels. Gate/up shards retain both
+corresponding channel ranges, and the memory planner uses the same partitioning.
+Every weight and reduction is preserved. The packed-cache ABI, 98,304-token
+context, 512-token prefill chunks, and 3 GiB reserve are unchanged.
+
+The direct-launch W4 kernel accepts these complete NZ tiles. The vendor reference
+binding still requires 128-channel output alignment, so reference/fallback calls
+pad only their temporary operands and crop before split-K accumulation. Serving
+retains the narrow resident banks. Native `muse_w4_v11_k1024` also carries the
+core's next tile assignment across nonempty prefill expert groups, avoiding a
+repeated partial tile batch on the same cores. Improving the old 640-channel
+shards alone gave only a 0.3% full-model prefill gain because the wider ranks
+still set the completion time.
+
+The first full-model comparison, before the affinity cleanup below, measured:
+
+| Measurement | Previous layout | Fine partitions |
+| --- | ---: | ---: |
+| Short decode, median of three | 2.393 tok/s | **2.473 tok/s** |
+| Cold prefill, 2,127 tokens | 35.549 s | **34.175 s** |
+| Decode after that prompt | 2.272 tok/s | **2.335 tok/s** |
+| Warm request, 2,048 cached tokens | 9.191 s | **8.855 s** |
+
+All 124 saved layer outputs (four-token prefill and cached one-token decode
+through all 62 layers) matched exactly. Standalone qualification covers the
+672/704/1344/1408-channel banks, changed inputs and routes, grouped prefill,
+empty groups, and the padded vendor reference. Streaming, cancellation recovery,
+repeated recapture, and native tool call/result handling also passed on this
+layout. These are single-request measurements and small correctness fixtures,
+not a broad coding or full-model 96K retrieval evaluation.
+
+A subsequent four-thread prefill experiment exposed an affinity lifecycle bug:
+the startup decode probe could leave the future server thread pinned to CPU 6.
+New API and OpenMP workers inherited that single-CPU mask. A live CPU sample
+showed all four compute threads sharing CPU 6 at about 24% CPU each; cold prefill
+regressed from 34.035 to 171.358 seconds. `66b641c` restores saved rank/caller
+masks during request-cache cleanup, resident-probe cleanup, and pool shutdown.
+It preserves prefix snapshots during successful request cleanup and tolerates
+already-exited streaming threads. The CPU suite now passes 148 tests, including
+probe failure and parent-mask inheritance regressions.
+
+Other rejected trials included reusable decode gathers, alternative SMT/CPU
+placements, captured host copies, and serial asynchronous rank launches. The
+serial launch trial lost 25% decode throughput. A wider one-row Cube reduction
+was exact but had no consistent standalone speedup. Retaining one expert row per
+core without a tile barrier failed the isolated correctness gate and was never
+loaded into the server. Adding the barrier restored exactness but gave mixed,
+small gains. The fresh trace's first-position stage-copy outliers include
+profiler startup overhead; they are not steady-state transport measurements.
+Evidence and experiment scripts are under `../results/muse-opt-v11` and
+`../runs/muse-opt-v11`.
+
+The first reload of the affinity cleanup stopped on the packed-cache checksum
+for layer 21. Two ordinary reads returned the same incorrect SHA256;
+`POSIX_FADV_DONTNEED` followed by a fresh read returned the original receipt's
+SHA256. The other 61 cached layers also verified. No files were rewritten and no
+integrity checks were bypassed. This isolates the observed mismatch to cached
+host pages, but does not identify its cause or establish a driver fix. The
+failed startup log and hashes are retained in `pagecache-integrity-event.json`
+and `cache-audit.json` alongside the experiment results.
+
+After the cleanup reload, all 124 layer outputs again matched exactly. Short
+median decode measured 2.473 tok/s; 2,127-token cold prefill took 33.935 seconds
+(62.68 tok/s). The guarded four-thread trial used the full 0–63 CPU mask and took
+33.513 seconds, versus 34.025/34.051-second one-thread controls. Its 1.57% prefill
+throughput gain accompanied a roughly 0.9% decode regression, so the selected
+configuration keeps one CPU thread. This trial establishes that the earlier
+single-CPU inheritance failure is fixed, not that more CPU threads are a useful
+serving optimization.
+
+The final serving image is `runtime-66b641c`, launched by
+`launch-muse-affinity-v11.sh`. Both ports share worker 1068710 and the original
+resident patch SHA256 `2a3f1bad1bc4ae7fb0fbd164d0ed78338d2351284454a022729646343a4f9a44`.
+All 428 frozen files verified. The final idle check found all 154 host threads
+back on CPU mask 0–63 and no new Ascend kernel errors since this successful
+reload. SSE cold/warm output, disconnect recovery, and three recapture cycles
+passed. Warm first text arrived in 2.449 seconds.
+
+A real Kilo session with only read/edit enabled completed read → edit → final
+confirmation in 160.598 seconds. It changed a temporary `add(a, b)` implementation
+from subtraction to addition, and an independent execution returned 5 for
+`add(2, 3)`. The three requests took 79.852 / 54.858 / 25.764 seconds server-side;
+the two follow-ups each reused 2,048 prompt tokens. This is a tiny integration
+check, not evidence of general coding quality. The current API usage object does
+not expose cached-token detail, so Kilo's displayed cache-read count remains
+zero even though the server records prefix reuse.
+
+The user's global Kilo model now advertises tool support. A `muse-code` primary
+agent enables read/edit/write/glob/grep/bash, with other tools disabled and
+existing permission rules preserved. The separate `muse-chat` entry remains
+text-only. The six-tool agent was configuration-validated; the executed edit
+smoke used the isolated two-tool agent. A private timestamped config backup was
+created. Larger coding tasks, the complete six-tool workflow, and further decode
+optimization remain to be evaluated.
