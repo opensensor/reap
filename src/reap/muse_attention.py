@@ -1,6 +1,6 @@
 """Bounded grouped attention with in-place FP16 KV appends and causal chunking."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import torch
 
 
@@ -10,9 +10,46 @@ class AppendCache:
     value: torch.Tensor | None = None
     seen: int = 0
     length: int = 0
+    _speculative_transaction: object | None = field(
+        default=None, repr=False, compare=False
+    )
 
 
 def bounded_attention(
+    q,
+    k,
+    v,
+    *,
+    start,
+    cache=None,
+    window=None,
+    max_context=65536,
+    prefill_chunk=64,
+    op=None,
+):
+    """Append ordinary KV, or defer compaction inside an explicit transaction."""
+    kwargs = dict(
+        start=start,
+        cache=cache,
+        window=window,
+        max_context=max_context,
+        prefill_chunk=prefill_chunk,
+        op=op,
+    )
+    transaction = None if cache is None else cache._speculative_transaction
+    if transaction is None:
+        return _bounded_attention(q, k, v, **kwargs)
+    with transaction.append(cache, start=start, count=q.shape[-2], window=window):
+        return _bounded_attention(q, k, v, **kwargs)
+
+
+# Resident replacements must preserve the hooks and delayed compaction before
+# advertising this capability. The transaction checks the currently installed
+# module function, so an older replacement fails before it can overwrite KV.
+bounded_attention.supports_speculative_cache_transactions = True
+
+
+def _bounded_attention(
     q,
     k,
     v,
@@ -136,7 +173,11 @@ def bounded_attention(
             )
             outputs.append(out)
     if cache is not None:
-        keep = min(length, window - 1) if window is not None else length
+        keep = (
+            min(length, window - 1)
+            if window is not None and cache._speculative_transaction is None
+            else length
+        )
         if keep < length and keep:
             cache.key[:, :, :keep].copy_(
                 cache.key[:, :, length - keep : length].clone()

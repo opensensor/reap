@@ -2002,3 +2002,27 @@ to defer sliding-cache compaction until the accepted prefix is committed;
 decrementing cache lengths after compaction loses necessary history. Matching
 Qwen DFlash2 weights cannot be attached to Muse Spark REAP without a compatible
 trained drafter.
+
+On the six-chip W4A8-wide server, three repeated 16-token oracle evaluations
+measured the following rates, excluding prompt processing and every draft cost:
+
+| Prompt | Sequential controls | B2 verification | B4 verification | B8 verification |
+| --- | ---: | ---: | ---: | ---: |
+| 7 tokens | 3.50–3.51 tok/s | 2.09 tok/s | 4.17 tok/s | 8.25 tok/s |
+| 4,254 tokens | 3.18–3.21 tok/s | 2.06 tok/s | 4.06 tok/s | 7.90 tok/s |
+
+B8 is a **2.36–2.47× perfect-draft ceiling**, not achieved speculative serving
+speed. All measured greedy IDs match the sequential tape. Batched logits differ
+(maximum absolute differences 0.613 and 2.533 respectively), so this does not
+establish distributional identity or broad greedy equivalence. Simply replacing
+grouped MoE with eager routed calls did not materially improve these timings.
+
+`SpeculativeCacheTransaction` provides a separate, opt-in rejection-cache
+prototype. It defers sliding compaction for one verification forward, commits
+any accepted input count including zero, and restores cache positions plus
+`runtime.seen` on abort. It never clones full-attention allocations; sliding
+commit backups are bounded by window size. Transactions reject unsupported
+attention replacements before mutation. Resident patches must explicitly retain
+the hooks and delayed compaction to participate. The cache prototype passes 35
+new CPU cases, alongside 13 existing attention tests and 17 oracle tests; it is
+not enabled in the frozen serving runtime or validated on hardware yet.
