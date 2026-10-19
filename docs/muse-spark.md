@@ -2120,3 +2120,17 @@ The authenticated `POST /resident/lookup-mode` action takes exactly
 request lock. It preserves the prompt prefix and loaded weights, so controlled
 plain/lookup comparisons do not require another model reload. Startup still
 uses the explicitly selected command-line value.
+
+The first lookup-enabled Kilo CLI read/edit/confirm smoke passed on the same
+fixture path and user prompt as its plain W4A8 control. Wall time fell from
+181.35 to 152.44 seconds (15.9% lower). Both runs emitted 104/112/67 tokens,
+used identical read/edit arguments, preserved 4096/4608-token prefix reuse,
+and produced the correct edit and final confirmation. The opening sentence
+reordered words, so this is not an exact-output-equivalence result. Server
+decode time summed to 88.31 seconds plain versus 58.78 seconds lookup (1.50x);
+prefill remained 89.19 versus 89.57 seconds across the three requests.
+Lookup acceptance varied from 23.5% to 45.3%; cache commits totaled 0.77 seconds.
+The separate warm SSE check matched plain completion text, reused all 152
+prompt tokens, and returned first text in 8.8 ms. These are single-run smokes.
+Frozen `b6d1b83` is left serving on 8001/8002 with lookup cap 7 and the guarded
+graph patch; v21 receipts retain the full comparison and validation details.
