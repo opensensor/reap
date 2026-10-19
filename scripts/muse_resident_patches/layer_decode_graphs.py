@@ -414,17 +414,18 @@ def prefill_moe(self, x):
 
 
 _prefill_staging = {}
+_prefill_gathers = {}
 
 
 def prefill_project(self, inputs, *, ids=None, ends=None):
     if (ids is None) == (ends is None):
         raise ValueError("provide routed IDs or grouped ends")
     device = inputs.device
-    host_inputs = inputs.cpu()
-    host_routes = (ids if ids is not None else ends).cpu()
+    # Copy directly to reusable pinned staging below. A pageable .cpu()
+    # temporary otherwise incurs allocation/fill plus another full host copy.
+    host_inputs = inputs
+    host_routes = ids if ids is not None else ends
     use_graph = self.decode_graphs and ids is not None and len(inputs) == 8
-    if use_graph:
-        self.prepare_graphs(host_inputs, host_routes)
 
     def run(i, phase, value):
         rank = self.ranks[i]
@@ -467,9 +468,13 @@ def prefill_project(self, inputs, *, ids=None, ends=None):
                 for t in (host_inputs, host_routes)
             )
             _prefill_staging[self.pool, phase] = buffers
-        buffers[0].copy_(host_inputs)
+        if host_inputs.device.type != "cpu" or not host_inputs.is_pinned():
+            buffers[0].copy_(host_inputs)
+            host_inputs = buffers[0]
         buffers[1].copy_(host_routes)
-        host_inputs, host_routes = buffers
+        host_routes = buffers[1]
+        if use_graph and phase == "up":
+            self.prepare_graphs(host_inputs, host_routes)
         futures = [
             self.pool.submit(run, i, phase, host_inputs) for i in range(len(self.ranks))
         ]
@@ -482,5 +487,22 @@ def prefill_project(self, inputs, *, ids=None, ends=None):
                 failures.append(exc)
         if failures:
             raise failures[0]
-        host_inputs = torch.cat(results, dim=-1)
+        # Every rank has finished its blocking result copy. Separate up/down
+        # gather buffers stay alive through the next phase and final upload.
+        # out= also avoids repeatedly initializing a large temporary under
+        # deterministic execution. Never alter the global deterministic policy.
+        shape = (results[0].shape[0], sum(value.shape[-1] for value in results))
+        key = self.pool, phase
+        gathered = _prefill_gathers.get(key)
+        if (
+            gathered is None
+            or gathered.shape != shape
+            or gathered.dtype != results[0].dtype
+        ):
+            gathered = torch.empty(
+                shape, dtype=results[0].dtype, device="cpu", pin_memory=True
+            )
+            _prefill_gathers[key] = gathered
+        torch.cat(results, dim=-1, out=gathered)
+        host_inputs = gathered
     return host_inputs.to(device)

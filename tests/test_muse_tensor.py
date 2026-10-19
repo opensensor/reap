@@ -106,20 +106,35 @@ def test_parallel_gather_preserves_expert_rows_and_uneven_column_order(
                 down=Bank(down[:, lo:hi]),
             )
         )
-    expected = torch.cat(
-        [
-            F.linear(
-                F.silu(F.linear(x[i : i + 1], gate[e])) * F.linear(x[i : i + 1], up[e]),
-                down[e],
-            )
-            for i, e in enumerate(ids)
-        ]
-    )
     pool = make_pool(ranks)
     try:
         tp = TensorExperts(ranks, pool, decode_graphs=False)
-        actual = tp.project(x, **({"ends": ends} if grouped else {"ids": ids}))
-        torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-5)
+        previous_gathers = None
+        for step, repeat in enumerate((1, 1, 2, 1)):
+            current = (x + step * 0.125).repeat_interleave(repeat, dim=0)
+            current_ids = ids.repeat_interleave(repeat)
+            expected = torch.cat(
+                [
+                    F.linear(
+                        F.silu(F.linear(current[i : i + 1], gate[e]))
+                        * F.linear(current[i : i + 1], up[e]),
+                        down[e],
+                    )
+                    for i, e in enumerate(current_ids)
+                ]
+            )
+            actual = tp.project(
+                current,
+                **({"ends": ends * repeat} if grouped else {"ids": current_ids}),
+            )
+            torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-5)
+            if implementation == "resident-prefill":
+                gathers = scope["_prefill_gathers"]
+                assert len(gathers) == 2
+                pointers = [gathers[pool, phase].data_ptr() for phase in ("up", "down")]
+                if step == 1:
+                    assert pointers == previous_gathers
+                previous_gathers = pointers
     finally:
         pool.shutdown()
 
