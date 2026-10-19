@@ -1245,3 +1245,124 @@ place. Rollback uses `runtime-3612570` / `launch-muse-prefill-v8.sh` and native
 The live identity request with tools, native `lookup` call, and tool-result
 response also pass through SSE (`tools-validation-summary.json`). These interface
 smokes do not establish broad coding or tool-selection quality.
+
+### Load-time query/gate sharding (2026-10-18)
+
+`8dc6f8f` adds optional `--tensor-attention` to the server and deployment launcher.
+It requires tensor experts and bounded attention. Query and attention-gate output
+channels are distributed across the existing six ranks during loading, including
+packed-cache loads. The dense owner never receives a second copy of those two
+matrices. Every rank keeps its query/gate rows together in NZ format; ordered
+host gathers reconstruct queries followed by gates. FP16 weights, reductions,
+routing and KV precision are unchanged.
+
+Decode reuses the expert pool and graph lifecycle. Prefill uses the same shards
+with dynamic row counts and bounded pinned staging. Futures are drained on
+failure before host buffers can be reused. Resident storage identity includes
+all six query/gate shards. The memory planner redistributes their existing
+bytes and rebalances the remaining dense/KV stages to
+`0/5/17/30/43/57/62`; it preserves 98,304-token context and the 3 GiB reserve.
+This removes the previous prototype's 16,642,998,272 duplicate weight bytes.
+
+The frozen `runtime-8dc6f8f` contains 427 verified files and uses the unchanged
+`muse_w4_v9_k1024` native backend. The new launcher is
+`/srv/ai/storage/experiments/muse-contribution128-w4/launch-muse-dense-v10.sh`;
+`launch-muse-decode-v9.sh` remains the rollback. All 62 packed layers were cache
+hits. After capture, the tightest chip had approximately 3.6 GiB free instead of
+the duplicate-weight prototype's approximately 707 MiB.
+
+Validation includes 138 focused tests, real layer-0 query/gate projections at
+1/7/128/512 tokens with changing inputs and graph resets, and exact comparisons
+against saved pre-reload outputs at every one of the 62 layers for four-token
+prefill plus cached single-token decode. Startup also compares all logits before
+and after activating the resident graphs.
+
+| Measurement | Previous deployment | Load-time sharding |
+| --- | --- | --- |
+| Short decode, median of three | 2.184 tok/s | **2.313 tok/s** |
+| Decode after 2,127 prompt tokens | 2.082 tok/s | **2.204 tok/s** |
+| Cold 2,127-token prefill | 49.753 s | 50.633 s |
+| Repeated-prefix request, 16 output tokens | 10.028 s | 9.624 s |
+
+Short decode improves 5.91% in this before/reload comparison. The same-process
+prototype's previous balanced controls independently measured a 5.66% gain.
+Cold prefill is slightly slower; no prefill gain is claimed. The real projection
+microbenchmark also showed this tradeoff: query/gate decode fell from about
+1.54 ms to 0.89 ms, while the 512-token operation rose from about 5.38 ms to
+6.31 ms. Full-model text and usage match the saved short/long completion fixtures.
+Evidence and experiment scripts are under `../results/muse-opt-v10` and
+`../runs/muse-opt-v10`, mirrored remotely under `opt-v10`.
+
+A follow-up host-affinity trial compared three repetitions per setting with
+restored-default controls. Pinning rank threads to CPUs 0–5 and the inference
+thread to CPU 6 reached 2.386 tok/s versus 2.311/2.310 tok/s controls (+3.24%).
+Spreading those threads across CPUs 0/4/8/12/16/20/24 measured 2.295 tok/s and
+was rejected. Pinning multi-token prefill also increased its observed cold time
+to 51.883 seconds, so the deployment override is limited to single-token decode.
+Multi-token prefill restores the original thread masks.
+
+The resident patch defaults to no affinity override. A frozen deployment copy
+can append `CPU_AFFINITY = (0, 1, 2, 3, 4, 5, 6)` for this 3970X host. It validates
+all target masks before changing any thread, restores changes on syscall failure,
+and restores saved masks when the override is disabled. This setting is specific
+to the measured host; it is not a general CPU layout recommendation.
+
+The decode-only affinity trial used patch `b09148c`, hot-loaded into the
+`8dc6f8f` process. It measured **2.385 tok/s** short decode, **2.293 tok/s** after
+2,127 prompt tokens, 50.708-second cold prefill, and 9.406-second repeated-prefix
+requests. The overall short-decode gain over this round's starting deployment is
+**9.20%**. These are single-request measurements; cold prefill remains slightly
+slower than the original deployment, and no prefill throughput gain is claimed.
+The optional-affinity checks bring the focused suite to **141 passing tests**.
+
+That trial froze `runtime-b09148c` with 428 verified files, including the
+configured frozen patch `layer_decode_graphs_affinity.py`. The primary launcher
+is `launch-muse-affinity-v10.sh`; `launch-muse-dense-v10.sh` retains sharding with
+default CPU scheduling, and `launch-muse-decode-v9.sh` retains the pre-sharding
+runtime. The active configured patch SHA256 is
+`69746f2f574ffef997d1e094a8df7ff99811d5500bf9f64e195e571db0e91570`.
+
+### Prefill staging after profiling (2026-10-18)
+
+The next trace sampled the first four layers of a 512-token prefill chunk.
+Summed host self durations included 132.6 ms in concatenation and 60.5 ms in
+fill operations; the six-device native W4 tasks summed to 1,041.0 ms. Device and
+worker times overlap and must not be read as serial request wall time. The trace
+identified repeated large host allocations/copies around expert projection.
+
+Patch `bae3318` copies routed activations and metadata directly into reusable
+pinned staging. It gathers expert outputs into separate reusable pinned up/down
+buffers with `torch.cat(..., out=...)`, then uses the up gather directly as the
+down-phase input. This removes a pageable `.cpu()` temporary, repeated gather
+allocation/initialization and a redundant host copy. Global deterministic
+execution and uninitialized-memory policy are unchanged. All rank futures finish
+before a gather can be overwritten; the final upload is blocking. Tests vary
+inputs, grouped/routed metadata and row counts while checking numerical ordering,
+buffer reuse and bounded cache cardinality.
+
+Cold prefill qualification, with 2,127 prompt tokens and identical completions:
+
+| Trial | Control before | Candidate | Control after |
+| --- | --- | --- | --- |
+| Reusable gathers | 50.648 s | 41.564 s | 51.320 s |
+| Direct pinned staging plus gathers | 51.069 s | **35.574 s** | 50.780 s |
+
+The combined prefill change improves throughput **43.15%** over the mean of its
+surrounding controls. A separate final-source run reproduced **35.567 seconds
+(59.802 tok/s)**. Final short-decode median is **2.380 tok/s**, versus this turn's
+2.184 tok/s starting point (**8.98%** faster); decode after 2,127 tokens is
+**2.291 tok/s**. A repeated-prefix request takes **9.136 seconds** total. These
+remain single-request measurements; the long-prompt trial uses one request per
+control/candidate position, followed by a separate final-source repeat.
+
+The selected next-start image is `runtime-bae3318`, containing 428 verified files.
+`launch-muse-prefill-v10.sh` activates native `muse_w4_v9_k1024` and the configured
+resident patch with decode CPU affinity. Its SHA256 is
+`2a3f1bad1bc4ae7fb0fbd164d0ed78338d2351284454a022729646343a4f9a44`.
+The current process retains the `8dc6f8f` load-time layout and hot-loads this patch.
+`launch-muse-affinity-v10.sh` rolls back the prefill transport change, while
+`launch-muse-decode-v9.sh` restores the pre-sharding runtime. Context remains
+98,304 tokens, with the same three-GiB reserve. The focused suite passes all
+**141 tests**. Trace CSVs and summaries are in `../results/muse-opt-v10/trace-prefill`;
+controlled trials are `reuse-prefill-performance.json`,
+`direct-prefill-performance.json` and `final-performance.json`.
