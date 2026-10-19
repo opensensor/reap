@@ -1712,3 +1712,63 @@ threads have CPU mask 0–63 after cleanup, storage identities are unchanged,
 and no new Ascend kernel errors were found since this reload. Context remains
 98,304 tokens. The actual Kilo read/edit smoke was not repeated in this round;
 its previous 232.586-second result remains the latest end-to-end evidence.
+
+### Additional QFN kernel reuse audit (2026-10-19)
+
+Muse's selected W4A16 kernel already reuses Qwen's lossless NZ packing and
+FP16 Cube implementation. The Qwen native INT4 path is a distinct opportunity:
+two signed INT4 products operate directly on packed W4, avoiding FP16 weight
+unpacking. It introduces per-row, per-128-element-group A8 activation
+quantization. This is not W2 weight quantization, and it is not numerically
+identical to the serving W4A16 path.
+
+An isolated prototype reused existing `npu_qwen_w4_a8_pack_310` and
+`npu_qwen_w4_a8_int4_matmul_310` operators from the Qwen coherent operator bundle.
+The Muse extension exposes these bindings but its frozen W4-only operator
+bundle lacks their ACL entry points; the initial attempt stopped before launch.
+The successful tests use
+`/srv/ai/src/qwen38-coherent-opp-20261001-r2/vendors/qwen38_coherent_transformer`
+in a separate process. Production operator paths remain unchanged.
+
+The adapter reverses Muse's lossless tile layout, verifies exact repacking,
+encodes the same W4 codes/scales for the native INT4 ABI, and zero-pads output
+channels to the existing binding's 128-channel alignment. Both 2,048-wide
+K partitions, activation packing, output cropping, FP16 partial products and
+the FP32 partial sum are included in timings. Four synthetic shape/mode cases
+cover 128 experts, 672/1408 output channels and 8/512 routed rows. An independent
+CPU A8 calculation differs by at most 0.000977 on the checked rows.
+
+Read-only capture then saved real layer-0 rank-0 weights, activations, routes
+and outputs for four-token prefill and cached decode. Replaying W4A16 matches
+the captured outputs exactly. The native INT4 candidate gives:
+
+| Real projection | Mode | W4A16 control | Qwen W4A8 | Relative RMS difference |
+| --- | --- | ---: | ---: | ---: |
+| Gate/up, 1408 outputs | Decode graph, 8 routes | 1.454 ms | **0.660 ms** | 0.176% |
+| Down, 704 outputs | Decode graph, 8 routes | 0.757 ms | **0.447 ms** | 0.752% |
+| Gate/up, 1408 outputs | Prefill, 32 routes | 4.022 ms | **1.793 ms** | 0.155% |
+| Down, 704 outputs | Prefill, 32 routes | 2.123 ms | **1.274 ms** | 1.127% |
+
+Controls are the mean of before/after medians; each arm discards five warmups
+and uses twenty measured repetitions. Decode graph projection time decreases
+about 55% and 41%, respectively. These isolated projections do not establish
+full-layer or full-model speed, nor accuracy after error propagates through
+62 layers. The captured down input is the original W4A16 activation, not an
+activation produced by the candidate gate/up projection. Integration therefore
+requires a complete candidate MLP/layer test and held-out coding/teacher-forced
+quality gates before a deployment decision.
+
+Qwen's builtin fused SwiGLU also runs faster at Muse's dimensions, but changes
+the intermediate FP16 rounding; on these real gate/up outputs its relative RMS
+difference is about 0.039%. QFN's specialized fused gate-pack and route epilogues
+hard-code different dimensions/top-k and arithmetic. They need adaptations:
+Muse normalizes each expert output and sums eight weighted contributions in
+ascending expert order with FP16 rounding. QFN recurrent/sparse attention and
+MTP state kernels likewise do not implement Muse's attention architecture.
+
+Evidence and scripts are retained in `results/muse-opt-v15` and
+`runs/muse-opt-v15`; captured weights remain on Threadripper under `opt-v15`.
+The observer was removed through the exact-logit gate, with the original
+Python digest and weight-storage identity restored. Neither W4A8 nor fused
+SwiGLU is enabled in serving. The next priority is adapting and qualifying this
+existing native INT4 path before writing a new dispatcher.
