@@ -2011,11 +2011,50 @@ measured the following rates, excluding prompt processing and every draft cost:
 | 7 tokens | 3.50–3.51 tok/s | 2.09 tok/s | 4.17 tok/s | 8.25 tok/s |
 | 4,254 tokens | 3.18–3.21 tok/s | 2.06 tok/s | 4.06 tok/s | 7.90 tok/s |
 
-B8 is a **2.36–2.47× perfect-draft ceiling**, not achieved speculative serving
-speed. All measured greedy IDs match the sequential tape. Batched logits differ
+Without verification graphs, B8 gives a **2.36–2.47× perfect-draft ceiling**,
+not achieved speculative serving speed. All measured greedy IDs match the
+sequential tape. Batched logits differ
 (maximum absolute differences 0.613 and 2.533 respectively), so this does not
 establish distributional identity or broad greedy equivalence. Simply replacing
 grouped MoE with eager routed calls did not materially improve these timings.
+
+The separately qualified, opt-in
+`scripts/muse_resident_patches/layer_verification_graphs_v1.py` adds owner
+preparation/combination graphs and per-rank projection graphs for B2/B4/B8.
+It uses the existing native W4A8 kernels, shared graph pools, pinned transport,
+and FP16 expert accumulation order. B1 and other prefill sizes retain their
+existing paths. The versioned file preserves the measured source exactly:
+SHA256 `b8fe5b57a99ff40f1aeef17285a3a60a142fb190bed359283c216d0307662e7f`.
+It also retains that experiment's caller/rank CPU affinity `(0,1,2,3,4,5,6)`.
+
+With this patch, three repeated 16-token oracle evaluations measured:
+
+| Prompt | B2 verification | B4 verification | B8 verification | B8 oracle speedup |
+| --- | ---: | ---: | ---: | ---: |
+| 7 tokens | 5.20 tok/s | 9.51 tok/s | **16.51 tok/s** | **4.77×** |
+| 4,254 tokens | 4.83 tok/s | 8.87 tok/s | **15.03 tok/s** | **4.71×** |
+
+Each layer's first two calls at each supported block size compare its complete
+MoE result exactly against grouped execution on the same input. The reference
+is copied before graph execution can reuse staging buffers. All **186 layer /
+block-size cases passed twice** on hardware. Qualification finishes during the
+gate and shape warmups, before measured oracle samples; mismatches raise an
+error and remain failed for that patch instance. The patch exposes
+`routed_block_qualification_status()` in its function globals so the caller can
+inspect coverage instead of treating the four-token resident gate as proof of
+every shape. CPU tests cover alternating shapes, metadata retention, exact
+expert combination, failure draining, and the two-call guard.
+
+These higher rates remain **zero-draft, all-accepted verification ceilings**.
+They exclude prompt processing, draft generation, acceptance decisions, cache
+restoration, and rejected proposals. All sampled greedy IDs matched, but
+batched versus sequential logits still differed by up to 0.613 and 2.533 on the
+two prompts. Exact same-shape MoE comparisons do not establish distributional
+identity across different batch shapes or general greedy equivalence. The
+trial restored the original serving patch afterward; this version remains an
+explicit resident/startup patch choice, not an enabled speculative decoder.
+Evidence is in the v19 `oracle-graphs-results.json`,
+`routed-block-graph-parity.json`, and `routed-graphs-restored.json` receipts.
 
 `SpeculativeCacheTransaction` provides a separate, opt-in rejection-cache
 prototype. It defers sliding compaction for one verification forward, commits
@@ -2024,5 +2063,26 @@ any accepted input count including zero, and restores cache positions plus
 commit backups are bounded by window size. Transactions reject unsupported
 attention replacements before mutation. Resident patches must explicitly retain
 the hooks and delayed compaction to participate. The cache prototype passes 35
-new CPU cases, alongside 13 existing attention tests and 17 oracle tests; it is
-not enabled in the frozen serving runtime or validated on hardware yet.
+new CPU cases, alongside 13 existing attention tests and 17 oracle tests.
+Isolated FP16 qualification subsequently passed 42 cases on each of all six
+310P devices (252 total), including every accepted count for B2/B4/B8,
+sliding windows of 8 and 2048 after a 2080-token prefix, and failure rollback.
+Committed KV bytes and identical-shape next-decode outputs matched exactly;
+cache allocations remained unchanged. Peak extra allocated memory was
+15,608,320 bytes per device. This qualifies cache mechanics independently of
+full-model batched-logit equivalence. Receipts are
+`cache-device-v3-results.json` and `cache-devices-1-5-results.json` in v19.
+The first qualifier launch omitted CANN's Python path; its corrected run also
+uses the server's `jit_compile=False` mode. No installed driver was changed.
+
+The authenticated, loopback-only `POST /resident/lookup` endpoint measures
+actual greedy generation with an incremental prompt/history n-gram drafter.
+It takes `prompt`, `max_new_tokens` (1–128), and `max_proposal_tokens` (0–7).
+Zero proposals provides the sequential control. Proposals are trimmed to
+1/3/7 tokens so verification uses the qualified B2/B4/B8 shapes; misses use B1.
+Responses include nonempty generated token IDs and separate drafting,
+verification, acceptance, cache-commit, and fallback timings. The endpoint
+shares the generation lock, resets before and after each experiment, and
+checks resident weight-storage identity even on failure. It is a research
+endpoint; ordinary chat generation is unchanged. A learned DFlash model is
+not used, and full-model token equivalence must be checked for each trial.

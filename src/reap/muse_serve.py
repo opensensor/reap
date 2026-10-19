@@ -53,6 +53,18 @@ class StreamOptions(BaseModel):
     include_usage: bool = False
 
 
+class LookupRequest(BaseModel):
+    """Bounded, trusted local research input; never used for chat requests."""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+    prompt: str = Field(min_length=1, max_length=1_048_576)
+    max_new_tokens: int = Field(default=32, ge=1, le=128)
+    max_proposal_tokens: int = Field(default=7, ge=0, le=7)
+    min_ngram: int = Field(default=2, ge=1, le=16)
+    max_ngram: int = Field(default=4, ge=1, le=16)
+    max_index_entries: int = Field(default=65536, ge=1, le=65536)
+
+
 class Request(BaseModel):
     model_config = ConfigDict(extra="forbid")
     model: str | None = None
@@ -355,13 +367,30 @@ def create_app(
         @app.post("/resident/{action}")
         def resident_action(action: str, body: dict, request: HTTPRequest):
             authorize(request)
-            if action not in ("load-native", "switch", "oracle"):
+            if action not in ("load-native", "switch", "oracle", "lookup"):
                 raise HTTPException(404, "unknown resident action")
             if not lock.acquire(blocking=False):
                 raise HTTPException(503, "runtime is handling another request")
             try:
                 if action == "load-native":
                     return resident.load_native(body)
+                if action == "lookup":
+                    options = LookupRequest.model_validate(body)
+                    if options.min_ngram > options.max_ngram:
+                        raise ValueError("min_ngram must not exceed max_ngram")
+                    ids = tokenizer.encode(options.prompt)
+                    if (
+                        not ids
+                        or len(ids) + options.max_new_tokens > runtime.max_context
+                    ):
+                        raise ValueError(
+                            "lookup prompt and generation exceed context or are empty"
+                        )
+                    return resident.lookup(
+                        prompt_ids=ids,
+                        eos=eos,
+                        **options.model_dump(exclude={"prompt"}),
+                    )
                 if action == "oracle":
                     if set(body) - {"prompt", "block_sizes", "repeats", "max_tokens"}:
                         raise ValueError("unknown oracle fields")

@@ -131,6 +131,64 @@ class Resident:
         finally:
             self.runtime.reset()
 
+    def lookup(
+        self,
+        *,
+        prompt_ids,
+        max_new_tokens=32,
+        max_proposal_tokens=7,
+        min_ngram=2,
+        max_ngram=4,
+        max_index_entries=65536,
+        eos=(),
+    ):
+        """Research-only lookup run; caller must hold the shared request lock."""
+        from reap.muse_lookup import generate
+
+        self.require_ready()
+        bounds = (
+            (max_new_tokens, 1, 128),
+            (max_proposal_tokens, 0, 7),
+            (min_ngram, 1, 16),
+            (max_ngram, 1, 16),
+            (max_index_entries, 1, 65536),
+        )
+        if (
+            any(
+                type(value) is not int or not low <= value <= high
+                for value, low, high in bounds
+            )
+            or min_ngram > max_ngram
+            or not isinstance(prompt_ids, (list, tuple))
+            or not prompt_ids
+            or any(type(token) is not int or token < 0 for token in prompt_ids)
+            or len(prompt_ids) + max_new_tokens > self.runtime.max_context
+        ):
+            raise ValueError("invalid or unbounded resident lookup options")
+        self.runtime.reset()
+        try:
+            result = generate(
+                self.runtime,
+                prompt_ids,
+                max_new_tokens=max_new_tokens,
+                max_proposal_tokens=max_proposal_tokens,
+                min_ngram=min_ngram,
+                max_ngram=max_ngram,
+                max_index_entries=max_index_entries,
+                eos=eos,
+            )
+            self.synchronize()
+            return {**self.status(), "benchmark": result}
+        finally:
+            try:
+                # Check even when generation raised: changing a weight
+                # allocation must block later inference, not hide in cleanup.
+                if self.storage_identity() != self.identity:
+                    self.failed = "lookup benchmark changed resident weight storage"
+                    raise RuntimeError(self.failed)
+            finally:
+                self.runtime.reset()
+
     def load_native(self, manifest):
         self.require_ready()
         checker, factory = check_manifest, NativeW4
