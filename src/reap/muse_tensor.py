@@ -236,25 +236,40 @@ def shard_layer(
     # rounding made the widest expert shard 768 rather than 704 channels.
     gate_ranges = partitions(cpu.down.inputs, len(devices), cpu.index, alignment=32)
     down_ranges = partitions(cpu.down.outputs, len(devices), cpu.index, alignment=32)
+    cached = getattr(cpu, "native_a8_ranks", None)
+    if cached is not None and (expert_backend is None or len(cached) != len(devices)):
+        raise ValueError("native A8 cache requires the matching backend and rank count")
     ranks = []
-    for device, (lo, hi), (down_lo, down_hi) in zip(devices, gate_ranges, down_ranges):
+    for rank_index, (device, (lo, hi), (down_lo, down_hi)) in enumerate(
+        zip(devices, gate_ranges, down_ranges)
+    ):
         middle = cpu.down.inputs
-        gate_up = slice_bank(
-            cpu.gate_up,
-            [(lo, hi), (middle + lo, middle + hi)],
-            "cpu" if expert_backend is not None else device,
-        )
-        down = slice_bank(
-            cpu.down,
-            [(down_lo, down_hi)],
-            "cpu" if expert_backend is not None else device,
-        )
-        if expert_backend is not None:
+        if cached is not None:
             from reap.muse_int4 import DirectA8Bank
 
-            # Repack host slices before transfer: never retain both device layouts.
-            gate_up = DirectA8Bank(gate_up, device, expert_backend)
-            down = DirectA8Bank(down, device, expert_backend)
+            gate_up, down = (
+                DirectA8Bank.from_native(
+                    bank.parts, bank.inputs, bank.outputs, device, expert_backend
+                )
+                for bank in cached[rank_index]
+            )
+        else:
+            gate_up = slice_bank(
+                cpu.gate_up,
+                [(lo, hi), (middle + lo, middle + hi)],
+                "cpu" if expert_backend is not None else device,
+            )
+            down = slice_bank(
+                cpu.down,
+                [(down_lo, down_hi)],
+                "cpu" if expert_backend is not None else device,
+            )
+            if expert_backend is not None:
+                from reap.muse_int4 import DirectA8Bank
+
+                # Repack host slices before transfer: never retain both device layouts.
+                gate_up = DirectA8Bank(gate_up, device, expert_backend)
+                down = DirectA8Bank(down, device, expert_backend)
         if str(device) == str(owner):
             weights = {
                 name: native_weight(value.clone(), device)

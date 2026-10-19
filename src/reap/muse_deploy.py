@@ -68,6 +68,8 @@ def run(args):
                 tensor_attention=getattr(args, "tensor_attention", False),
                 tensor_output=getattr(args, "tensor_output", False),
                 prefix_cache=getattr(args, "prefix_cache", False),
+                experimental_a8=getattr(args, "experimental_a8_manifest", None)
+                is not None,
             )
             while True:
                 memory = []
@@ -118,6 +120,8 @@ def run(args):
                 "resident_token_file",
                 "native_manifest",
                 "resident_patch_file",
+                "experimental_a8_manifest",
+                "experimental_a8_cache",
             ):
                 if getattr(args, option, None):
                     command.extend(
@@ -223,8 +227,18 @@ def main():
     parser.add_argument("--packed-cache", type=Path)
     parser.add_argument("--resident-token-file", type=Path)
     parser.add_argument("--native-manifest", type=Path)
+    parser.add_argument("--experimental-a8-manifest", type=Path)
+    parser.add_argument("--experimental-a8-cache", type=Path)
     parser.add_argument("--resident-patch-file", type=Path)
     args = parser.parse_args()
+    if args.experimental_a8_cache and not args.experimental_a8_manifest:
+        parser.error("--experimental-a8-cache requires --experimental-a8-manifest")
+    if args.experimental_a8_manifest:
+        if not (args.optimized and args.tensor_experts) or args.native_manifest:
+            parser.error("A8 requires optimized tensor experts and no W4A16 manifest")
+        from reap.muse_int4 import check_direct_manifest
+
+        check_direct_manifest(json.loads(args.experimental_a8_manifest.read_text()))
     if args.bounded_attention and (not args.optimized or args.max_context < 1):
         parser.error("--bounded-attention requires --optimized and positive context")
     if any(not device.startswith("npu:") for device in args.devices):

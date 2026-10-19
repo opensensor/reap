@@ -199,13 +199,6 @@ def test_direct_launch_descriptor_crop_and_geometry_lifetime():
     assert not calls
 
 
-def test_experimental_a8_cannot_enter_w4_resident_switch_controls():
-    from reap.muse_resident import Resident
-
-    with pytest.raises(ValueError, match="offline-only"):
-        Resident(SimpleNamespace(experimental_a8_manifest={}))
-
-
 def test_direct_builder_refuses_changed_upstream_anchors():
     import runpy
     from pathlib import Path

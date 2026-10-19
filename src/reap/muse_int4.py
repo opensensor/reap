@@ -168,6 +168,36 @@ class DirectA8Bank:
     def linear(self, x, *, ids=None, ends=None):
         return self.backend.linear(self, x, ids=ids, ends=ends)
 
+    @classmethod
+    def from_native(cls, parts, inputs, outputs, device, backend):
+        """Transfer a verified CPU cache without repacking or mmap-backed DMA."""
+        if not parts or inputs != sum(p[0].shape[-1] * 2 for p in parts):
+            raise ValueError("invalid cached A8 split geometry")
+        experts = parts[0][0].shape[0]
+        for q, scale, weight_sum in parts:
+            if (
+                q.ndim != 3
+                or q.shape[:2] != (experts, (outputs + 63) // 64 * 64)
+                or not 1 <= experts <= 128
+                or not 1 <= outputs <= 5120
+                or not 128 <= q.shape[-1] <= 1024
+                or q.shape[-1] % 64
+                or q.dtype != torch.int8
+                or scale.dtype != torch.float16
+                or weight_sum.dtype != torch.float16
+                or scale.shape != (*q.shape[:2], q.shape[-1] // 64)
+                or weight_sum.shape != scale.shape
+                or any(
+                    v.device.type != "cpu" or not v.is_contiguous()
+                    for v in (q, scale, weight_sum)
+                )
+            ):
+                raise ValueError("invalid cached A8 weight ABI")
+        result = cls.__new__(cls)
+        result.inputs, result.outputs, result.backend = inputs, outputs, backend
+        result.parts = [tuple(v.clone().to(device) for v in p) for p in parts]
+        return result
+
 
 class DirectA8:
     """Versioned direct launch; graph owners must retain warmup geometry tensors."""

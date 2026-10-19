@@ -474,10 +474,13 @@ class MuseRuntime:
         tensor_output=False,
         prefix_cache=False,
         experimental_a8_manifest=None,
+        experimental_a8_cache=None,
     ):
         self.root = Path(root)
-        # Explicit offline experiment only; Resident's exact-W4 controls reject it.
+        # Explicit opt-in; resident swaps remain within this weight/activation ABI.
         self.experimental_a8_manifest = experimental_a8_manifest
+        if experimental_a8_cache is not None and experimental_a8_manifest is None:
+            raise ValueError("native A8 cache requires the experimental A8 backend")
         if experimental_a8_manifest is not None:
             from reap.muse_int4 import check_direct_manifest
 
@@ -587,15 +590,29 @@ class MuseRuntime:
                 if tensor_experts:
                     from reap.muse_tensor import shard_layer
 
-                    cpu = loader(
-                        root,
-                        i,
-                        self.c,
-                        "cpu",
-                        journal=self.journal,
-                        verify=verify,
-                        packed_cache=packed_cache,
-                    )
+                    if experimental_a8_cache is not None:
+                        from reap.muse_int4_cache import load_native_layer
+
+                        cpu = load_native_layer(
+                            root,
+                            i,
+                            self.c,
+                            len(devices),
+                            experimental_a8_cache,
+                            journal=self.journal,
+                            verify=verify,
+                            packed_cache=packed_cache,
+                        )
+                    else:
+                        cpu = loader(
+                            root,
+                            i,
+                            self.c,
+                            "cpu",
+                            journal=self.journal,
+                            verify=verify,
+                            packed_cache=packed_cache,
+                        )
                     layer = shard_layer(
                         cpu,
                         devices,

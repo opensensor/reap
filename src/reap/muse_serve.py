@@ -538,12 +538,24 @@ def main():
     parser.add_argument("--packed-cache", type=Path)
     parser.add_argument("--resident-token-file", type=Path)
     parser.add_argument("--native-manifest", type=Path)
+    parser.add_argument("--experimental-a8-manifest", type=Path)
+    parser.add_argument("--experimental-a8-cache", type=Path)
     parser.add_argument("--resident-patch-file", type=Path)
     args = parser.parse_args()
     if args.bounded_attention and (not args.optimized or args.max_context < 1):
         parser.error("--bounded-attention requires --optimized and positive context")
     if args.resident_token_file and not args.optimized:
         parser.error("resident controls require --optimized")
+    a8_manifest = None
+    if args.experimental_a8_cache and not args.experimental_a8_manifest:
+        parser.error("--experimental-a8-cache requires --experimental-a8-manifest")
+    if args.experimental_a8_manifest:
+        if not (args.optimized and args.tensor_experts) or args.native_manifest:
+            parser.error("A8 requires optimized tensor experts and no W4A16 manifest")
+        from reap.muse_int4 import check_direct_manifest
+
+        a8_manifest = json.loads(args.experimental_a8_manifest.read_text())
+        check_direct_manifest(a8_manifest)
     native_manifest = None
     if args.native_manifest:
         if not args.resident_token_file:
@@ -593,6 +605,8 @@ def main():
         tensor_attention=args.tensor_attention,
         tensor_output=args.tensor_output,
         prefix_cache=args.prefix_cache,
+        experimental_a8_manifest=a8_manifest,
+        experimental_a8_cache=args.experimental_a8_cache,
     )
     torch.set_num_threads(1 if args.tensor_experts else 2)
     runtime.deterministic = args.deterministic

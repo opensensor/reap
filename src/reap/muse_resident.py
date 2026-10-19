@@ -38,10 +38,6 @@ def target(name):
 
 class Resident:
     def __init__(self, runtime):
-        if getattr(runtime, "experimental_a8_manifest", None) is not None:
-            raise ValueError(
-                "experimental A8 is offline-only; resident controls require W4A16"
-            )
         if not runtime.optimized:
             raise ValueError("resident controls require optimized runtime")
         self.runtime = runtime
@@ -52,6 +48,22 @@ class Resident:
         self.originals = {name: getattr(*target(name)) for name in TARGETS}
         self.devices = sorted({str(layer.device) for layer in self.layers})
         self.identity = self.storage_identity()
+        self.a8_manifest = getattr(runtime, "experimental_a8_manifest", None)
+        if self.a8_manifest is not None:
+            from reap.muse_int4 import check_direct_manifest
+
+            key = check_direct_manifest(self.a8_manifest)
+            backend = self.layers[0].gate_up.backend
+            if backend is None or any(
+                bank.backend is not backend
+                for layer in self.layers
+                for bank in (layer.gate_up, layer.down)
+            ):
+                raise ValueError("A8 resident banks must share their loaded backend")
+            name = self.a8_manifest["name"]
+            self.loaded[name] = key, backend
+            self.namespaces[self.a8_manifest["namespace"]] = self.a8_manifest["library"]
+            self.active = name
 
     def storage_identity(self):
         tensors = list(self.runtime.globals.items())
@@ -94,6 +106,7 @@ class Resident:
             "loaded_native": list(self.loaded),
             "failed": self.failed,
             "weight_storage_sha256": self.identity,
+            "expert_format": "W4A8" if self.a8_manifest is not None else "W4A16",
         }
 
     def require_ready(self):
@@ -104,7 +117,12 @@ class Resident:
 
     def load_native(self, manifest):
         self.require_ready()
-        key = check_manifest(manifest)  # All checks precede native mutation.
+        checker, factory = check_manifest, NativeW4
+        if self.a8_manifest is not None:
+            from reap.muse_int4 import DirectA8, check_direct_manifest
+
+            checker, factory = check_direct_manifest, DirectA8
+        key = checker(manifest)  # Reject cross-format swaps before native mutation.
         name, namespace = manifest["name"], manifest["namespace"]
         if name in self.loaded:
             if self.loaded[name][0] != key:
@@ -119,46 +137,60 @@ class Resident:
             raise ValueError("native namespace already registered outside this session")
         started = time.monotonic()
         try:
-            backend = NativeW4(manifest, self.devices)
+            backend = factory(manifest, self.devices)
             # Real resident gate/up banks on every stage: decode and grouped rows
             # crossing the old 128-row limit, with empty expert groups.
             with torch.inference_mode():
                 for device in self.devices:
                     layer = next(l for l in self.layers if str(l.device) == device)
-                    bank = layer.gate_up
-                    for grouped in (False, True):
-                        rows = 137 if grouped else 8
-                        x = (
-                            (
-                                torch.arange(rows * bank.inputs, dtype=torch.float32)
-                                .reshape(rows, bank.inputs)
-                                .remainder(97)
-                                / 970
+                    banks = (
+                        (layer.gate_up, layer.down)
+                        if self.a8_manifest is not None
+                        else (layer.gate_up,)
+                    )
+                    for bank in banks:
+                        for grouped in (False, True):
+                            rows = 137 if grouped else 8
+                            x = (
+                                (
+                                    torch.arange(
+                                        rows * bank.inputs, dtype=torch.float32
+                                    )
+                                    .reshape(rows, bank.inputs)
+                                    .remainder(97)
+                                    / 970
+                                )
+                                .half()
+                                .to(device)
                             )
-                            .half()
-                            .to(device)
-                        )
-                        if grouped:
-                            ends = torch.full(
-                                (bank.parts[0][0].shape[0],),
-                                rows,
-                                dtype=torch.int64,
-                                device=device,
+                            if grouped:
+                                ends = torch.full(
+                                    (bank.parts[0][0].shape[0],),
+                                    rows,
+                                    dtype=torch.int64,
+                                    device=device,
+                                )
+                                expected = (
+                                    bank.linear(x, ends=ends)
+                                    if self.a8_manifest is not None
+                                    else bank.linear(x, expert=0)
+                                )
+                                actual = backend.linear(bank, x, ends=ends)
+                            else:
+                                ids = torch.arange(
+                                    rows, dtype=torch.int32, device=device
+                                )
+                                old = bank.backend
+                                if self.a8_manifest is None:
+                                    bank.backend = None
+                                try:
+                                    expected = bank.linear(x, ids=ids)
+                                finally:
+                                    bank.backend = old
+                                actual = backend.linear(bank, x, ids=ids)
+                            torch.testing.assert_close(
+                                actual.cpu(), expected.cpu(), rtol=0, atol=0
                             )
-                            expected = bank.linear(x, expert=0)
-                            actual = backend.linear(bank, x, ends=ends)
-                        else:
-                            ids = torch.arange(rows, dtype=torch.int32, device=device)
-                            old = bank.backend
-                            bank.backend = None
-                            try:
-                                expected = bank.linear(x, ids=ids)
-                            finally:
-                                bank.backend = old
-                            actual = backend.linear(bank, x, ids=ids)
-                        torch.testing.assert_close(
-                            actual.cpu(), expected.cpu(), rtol=0, atol=0
-                        )
             self.synchronize()
             if self.storage_identity() != self.identity:
                 raise RuntimeError("resident weight storage changed")
@@ -189,6 +221,10 @@ class Resident:
 
     def switch(self, *, native=None, source=None):
         self.require_ready()
+        # A8 banks cannot fall back to the W4A16 vendor path. Python-only
+        # changes retain the active A8 kernel and its exact-output reference.
+        if native is None and self.a8_manifest is not None:
+            native = self.active
         if native is not None and native not in self.loaded:
             raise ValueError("native backend must be loaded and qualified first")
         code = compile(source, "<resident-candidate>", "exec") if source else None

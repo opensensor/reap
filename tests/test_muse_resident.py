@@ -139,3 +139,87 @@ def replacements():
     assert resident.failed is None and resident.generation == 0
     assert resident.storage_identity() == resident.identity
     torch.testing.assert_close(model.forward([1], True), expected, rtol=0, atol=0)
+
+
+def test_a8_python_swaps_preserve_backend_and_reject_w4_manifest(monkeypatch):
+    import reap.muse_int4 as module
+
+    model = runtime()
+    manifest = {"name": "a8", "namespace": "muse_a8_test", "library": {}}
+    model.experimental_a8_manifest = manifest
+    backend = object()
+    for layer in model.layers:
+        layer.gate_up.backend = layer.down.backend = backend
+
+    def validate(value):
+        if value != manifest:
+            raise ValueError("invalid direct A8 manifest")
+        return "a8-digest"
+
+    monkeypatch.setattr(module, "check_direct_manifest", validate)
+    resident = Resident(model)
+    monkeypatch.setattr(resident, "synchronize", lambda: None)
+    assert resident.status()["expert_format"] == "W4A8"
+    assert resident.switch()["active_native"] == "a8"
+    assert model.layers[0].gate_up.backend is backend
+    with pytest.raises(ValueError, match="invalid direct A8"):
+        resident.load_native({"name": "w4"})
+    assert resident.failed is None
+    wrong = """
+def wrong(self, x, eps, weight=None):
+    return x + 1
+def replacements():
+    return {"reap.muse_fast:FastMuseLayer.fast_rms": wrong}
+"""
+    with pytest.raises(AssertionError):
+        resident.switch(source=wrong)
+    assert resident.failed is None and resident.active == "a8"
+    assert model.layers[0].gate_up.backend is backend
+    assert resident.storage_identity() == resident.identity
+    alternate = object()
+    resident.loaded["a8-next"] = "next-digest", alternate
+    assert resident.switch(native="a8-next")["active_native"] == "a8-next"
+    assert resident.switch()["active_native"] == "a8-next"
+    assert model.layers[0].down.backend is alternate
+
+
+def test_a8_resident_rejects_mixed_bank_backends(monkeypatch):
+    import reap.muse_int4 as module
+
+    model = runtime()
+    model.experimental_a8_manifest = {}
+    monkeypatch.setattr(module, "check_direct_manifest", lambda _: "digest")
+    model.layers[0].gate_up.backend = object()
+    with pytest.raises(ValueError, match="share their loaded backend"):
+        Resident(model)
+
+
+def test_a8_native_qualification_uses_a8_reference(monkeypatch):
+    import reap.muse_int4 as module
+
+    model = runtime()
+    model.experimental_a8_manifest = {
+        "name": "initial",
+        "namespace": "muse_a8_initial_test",
+        "library": {},
+    }
+
+    class Backend:
+        def linear(self, bank, x, **routes):
+            return x[:, : bank.outputs] * 2
+
+    backend = Backend()
+    bank = model.layers[0].gate_up
+    bank.backend = model.layers[0].down.backend = backend
+    bank.linear = lambda x, **routes: bank.backend.linear(bank, x, **routes)
+    down = model.layers[0].down
+    down.linear = lambda x, **routes: down.backend.linear(down, x, **routes)
+    monkeypatch.setattr(module, "check_direct_manifest", lambda _: "digest")
+    candidate = Backend()
+    monkeypatch.setattr(module, "DirectA8", lambda *args: candidate)
+    resident = Resident(model)
+    monkeypatch.setattr(resident, "synchronize", lambda: None)
+    manifest = {"name": "next", "namespace": "muse_a8_next_test", "library": {}}
+    assert resident.load_native(manifest)["probe_passed"]
+    assert bank.backend is backend  # Loading qualifies but does not activate.
+    assert resident.loaded["next"][1] is candidate

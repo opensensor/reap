@@ -1865,9 +1865,9 @@ using the serving W4-only OPP, without requiring the vendor A8 operator bundle.
 All W4A16 controls remain exact. This confirms the narrower allocation and
 implicit offsets preserve the candidate's measured arithmetic.
 
-`MuseRuntime(..., experimental_a8_manifest=manifest)` enables this layout only
-through an explicit offline experiment. Serving CLI defaults are unchanged,
-and resident exact-W4 hot-swap controls reject the experimental runtime. The
+At v16, `MuseRuntime(..., experimental_a8_manifest=manifest)` enabled this layout
+only through an explicit offline experiment; serving/resident support follows
+below. The
 planner accounts for each padded shard and both metadata tensors; tests compare
 its byte totals with actual sharded-bank storage. On the real 62-layer model,
 its expert-bank totals match the independent capacity calculation exactly.
@@ -1880,3 +1880,53 @@ are retained in `runs/muse-opt-v16`; results are in `results/muse-opt-v16`.
 Full-model teacher-forced/coding quality and full-model prefill/decode throughput
 are the next gates. The live worker remains the qualified W4A16 offset-eight
 runtime; no A8 end-to-end performance gain is claimed.
+
+
+The optional `experimental_a8_cache` runtime path now stores converted native
+expert shards alongside the existing dense FP16 tensors. Cache identity includes
+the source export/config identity, native layout ABI and rank count. Every hit
+checks the file size and SHA-256 digest before reading tensors, and device
+transfers use independent host staging rather than DMA from the mmap. Writes
+are locked, fsynced and atomically published. A corrupt entry fails closed.
+
+The cache preserves all six shard tensors exactly in CPU tests and avoids the
+W4 loader/conversion on a hit. Tests also cover source/topology changes, rejected
+geometry, byte corruption and interrupted writes. The full **180-test Muse
+suite passed**, followed by the four cache tests after the final geometry guard.
+Real layer-zero conversion/save took 22.060 seconds; a verified hit took 2.252
+seconds. Dense tensors and independently converted up/down rank-zero banks
+matched exactly. A complete cached NPU reload remains to be measured.
+
+
+The v17 full-model W4A8 trial passed its predeclared teacher-forced aggregate
+gate on 9,777 next-token predictions: perplexity increased 0.0693%, mean KL was
+0.002437 and top-one agreement was 98.619%. Repository patches were the weaker
+subset (two samples, 864 tokens): perplexity increased 1.302% and top-one
+agreement was 96.296%. These measurements do not establish executable coding
+quality. All 62 source cache hashes passed; configured context remained 98,304.
+
+The before/A8/after short-decode medians were 2.595/2.964/2.617 tokens/s; after
+the 4,254-token prompt they were 2.470/2.823/2.455 tokens/s. The single cold
+prefill measurements per arm were 72.665/75.265/74.490 seconds. Thus decode
+improved about 13–15%, while cold prefill did not improve. The A8 runtime took
+886.4 seconds to load without the new native cache. Profiles and clean timings
+were collected separately in `results/muse-opt-v17`.
+
+Serving and deployment now accept `--experimental-a8-manifest` and optional
+`--experimental-a8-cache`. The A8 path requires optimized tensor experts and
+cannot be combined with a W4A16 native manifest. Resident controls register the
+already loaded A8 backend, preserve it during Python-only swaps, and qualify
+new A8 kernels against A8 outputs before activation. The exact-logit switch
+gate and storage-identity checks remain enabled; a cross-format manifest is
+rejected before native registration. Streaming, tool handling, prefix caching
+and both HTTP listeners use the existing server path.
+
+The deployment direction is now W4A8. The completed v17 runner had already
+restored W4A16 before this decision; subsequent A8 deployment/experiments must
+not automatically restore W4A16. A8 kernels can be compared and swapped while
+keeping the native weight layout resident.
+
+All 182 Muse tests pass with the serving/cache changes, including A8 native
+qualification, Python-only backend retention, mixed-backend rejection and
+failed-switch rollback. Full cached serving validation is run separately on
+the six NPUs.
