@@ -1181,3 +1181,67 @@ prefill chunk 512, tools and streaming remain enabled. Rollback uses
 `launch-muse-tools-v7.sh` or its original resident Python patch. Evidence is in
 `prefill-shared-safe-performance.json`, `shared-pinned-long-validation.json`,
 `driver-debug.json` and `final-health.json` under `../results/muse-opt-v8`.
+
+
+### Pinned decode and balanced W4 tiles (2026-10-18)
+
+Patch `f7b08a0` adds reusable pinned decode input/result buffers, avoiding repeated
+pageable allocations and copies at each expert phase. Blocking decode transfers
+won the comparison with asynchronous transfers; prefill retains its independently
+validated asynchronous uploads. Uneven rank widths have separate reusable result
+buffers. All futures are drained on failure before any shared buffer is reused.
+Identical rotary-phase tensors are shared across a stage, and layers without RoPE
+skip their construction. Rank workers retain their initialized device context.
+
+Native `muse_w4_v9_k1024` balances routed row/tile tasks across cores and replaces
+arithmetic nibble extraction with masks and exact FP16 scaling. FP16 dequantization,
+Cube products, split-K order and expert sums remain unchanged. Reproduction uses
+`scripts/muse_native/build.py --unpack mask` with the pinned external Qwen/Catlass
+inputs; the build checks the upstream blocks before transforming them and records
+all source and binary hashes. External headers are not vendored here.
+
+| Measurement | Same-round baseline | Deployed candidate |
+| --- | ---: | ---: |
+| Short decode, median of three | 2.092 before / 2.091 after | **2.183 tok/s** |
+| Decode after 2,127 prompt tokens | 1.997 | **2.085 tok/s** |
+| Cold 2,127-token prefill, one pair | 42.380 | 41.980 tok/s |
+| First text, cold / 2,048-token cached prefix | 50.194 s cold | 50.672 / **2.735 s** |
+
+The repeated short decode gain is **4.38%** over the mean of the baseline medians.
+Long-prompt outputs match the reference exactly, including all 16 SSE text chunks.
+Disconnect recovery and three additional reset/recapture cycles pass. There are
+**132 passing Muse tests**. No prefill gain is claimed for this change: the
+55.565 tok/s measured in the previous round was not reproduced in this round's
+control. Full-model 96K retrieval/quality remains unmeasured; configuration and
+KV allocation limits remain 98,304 tokens with 512-token prefill chunks.
+
+The device trace covers three decode tokens. The seven staged dense FP16 matrix
+operations consume about 184 ms per token; W4 kernel durations sum to 2.216 s
+across all six devices over those three tokens. Cross-device and host timings
+must not be added as serial wall time. FP32 router caching and combined local
+Q/K/V/gate projection did not improve on the simpler phase-cache candidate.
+Asynchronous shared pinned decode regressed. Reusing kernel masks across row/tile
+tasks added no reliable gain and is not selected.
+
+A separate dense-projection experiment split Q and attention-gate output channels
+across all six devices. Eight changing real-weight inputs matched exactly; a
+microbenchmark reduced their combined latency from 1.50 to 1.03 ms. Full-model
+resident qualification and three exact-output repetitions reached **2.302 tok/s**
+versus 2.179 tok/s controls (**5.66%** above the otherwise optimized runtime).
+However, retaining duplicate projection shards left only about **707 MiB** free
+on the tightest chip. This variant is **not deployed**: it consumes the memory
+needed for the long-context workspace. The next implementation should shard these
+weights during loading, rather than retaining both the original owner matrices
+and distributed copies, and must qualify prefill as well as decode. The prototype
+is retained in `../runs/muse-opt-v9/dense-tp.py` for that work.
+
+The frozen next-start image is `runtime-f7b08a0` (425 verified files), with launcher
+`launch-muse-decode-v9.sh`. The current process retains base image `2765412` and its
+weight identities; ports 8001/8002, native tool handling and streaming remain in
+place. Rollback uses `runtime-3612570` / `launch-muse-prefill-v8.sh` and native
+`muse_w4_v2_k1024`. No kernel modules were replaced. Evidence is under
+`../results/muse-opt-v9`, including `final-decode-performance.json`,
+`long-validation.json`, `dense-tp-performance.json` and `trace/summary.json`.
+The live identity request with tools, native `lookup` call, and tool-result
+response also pass through SSE (`tools-validation-summary.json`). These interface
+smokes do not establish broad coding or tool-selection quality.
