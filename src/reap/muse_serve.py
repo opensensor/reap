@@ -326,6 +326,7 @@ def create_app(
             "bounded_attention": getattr(runtime, "bounded_attention", False),
             "prefill_chunk": getattr(runtime, "prefill_chunk", None),
             "prefix_cache": getattr(runtime, "prefix_cache_enabled", False),
+            "tensor_output": getattr(runtime, "tensor_output", False),
             "deterministic": getattr(runtime, "deterministic", False),
             "streaming": True,
             "tools": True,
@@ -530,6 +531,7 @@ def main():
     parser.add_argument("--optimized", action="store_true")
     parser.add_argument("--tensor-experts", action="store_true")
     parser.add_argument("--tensor-attention", action="store_true")
+    parser.add_argument("--tensor-output", action="store_true")
     parser.add_argument("--deterministic", action="store_true")
     parser.add_argument("--bounded-attention", action="store_true")
     parser.add_argument("--prefix-cache", action="store_true")
@@ -589,6 +591,7 @@ def main():
         packed_cache=args.packed_cache,
         tensor_experts=args.tensor_experts,
         tensor_attention=args.tensor_attention,
+        tensor_output=args.tensor_output,
         prefix_cache=args.prefix_cache,
     )
     torch.set_num_threads(1 if args.tensor_experts else 2)

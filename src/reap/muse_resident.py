@@ -51,6 +51,11 @@ class Resident:
 
     def storage_identity(self):
         tensors = list(self.runtime.globals.items())
+        if hasattr(self.runtime, "output_head"):
+            tensors.extend(
+                (f"output_head.{i}", rank.weight)
+                for i, rank in enumerate(self.runtime.output_head.ranks)
+            )
         for i, layer in enumerate(self.layers):
             tensors.extend((f"{i}.{name}", value) for name, value in layer.w.items())
             if hasattr(layer, "attention_qg_weight"):

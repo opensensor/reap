@@ -442,7 +442,11 @@ def prefill_project(self, inputs, *, ids=None, ends=None):
                         routes.to(rank.device, non_blocking=True),
                         ends is not None,
                     )
-                return result.cpu()
+                # Rank-local buffers survive until every future has drained
+                # and the gather has finished. Keep one row count per shard
+                # width, so arbitrary prefill lengths cannot grow the cache.
+                key = ("prefill-result", i, phase, result.shape[-1])
+                return pinned_snapshot(self.pool, key, (result,))[0]
             except BaseException:
                 # Pinned source buffers must not be reused while DMA reads
                 # remain outstanding, including after an operator failure.

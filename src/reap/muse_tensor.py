@@ -313,6 +313,7 @@ def tensor_plan(
     *,
     prefix_cache=False,
     tensor_attention=False,
+    tensor_output=False,
 ):
     """Account for every shard, dense NZ matrix, KV slot, and global tensor."""
     from reap.muse_runtime import PREFIX
@@ -371,9 +372,16 @@ def tensor_plan(
     for filename, shard in journal["shards"].items():
         if filename.startswith("global-"):
             for name, record in shard["tensors"].items():
-                globals_[0 if name == PREFIX + "embed_tokens.weight" else -1] += record[
-                    "bytes"
-                ]
+                if tensor_output and name == "lm_head.weight":
+                    rows = record["shape"][0]
+                    for rank, (lo, hi) in enumerate(
+                        partitions(rows, ranks, alignment=32)
+                    ):
+                        globals_[rank] += record["bytes"] * (hi - lo) // rows
+                else:
+                    globals_[0 if name == PREFIX + "embed_tokens.weight" else -1] += (
+                        record["bytes"]
+                    )
     # Expert bytes are now spread across every device. Rebalance dense stages
     # separately, including the large embedding and output head at the ends.
     dp = {(0, 0): (0, [])}

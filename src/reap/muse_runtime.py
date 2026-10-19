@@ -316,9 +316,12 @@ def placement_plan(
     prefill_chunk=64,
     tensor_experts=False,
     tensor_attention=False,
+    tensor_output=False,
     prefix_cache=False,
 ):
     """Minimax contiguous layer placement, including globals and bounded KV."""
+    if tensor_output and not tensor_experts:
+        raise ValueError("tensor output requires tensor experts")
     if tensor_attention and not tensor_experts:
         raise ValueError("tensor attention requires tensor experts")
     if prefix_cache and not bounded_attention:
@@ -443,6 +446,7 @@ def placement_plan(
             reserve_gib,
             prefix_cache=prefix_cache,
             tensor_attention=tensor_attention,
+            tensor_output=tensor_output,
         )
     return stages
 
@@ -463,6 +467,7 @@ class MuseRuntime:
         packed_cache=None,
         tensor_experts=False,
         tensor_attention=False,
+        tensor_output=False,
         prefix_cache=False,
     ):
         self.root = Path(root)
@@ -491,6 +496,7 @@ class MuseRuntime:
         self.optimized = optimized
         self.tensor_experts = tensor_experts
         self.tensor_attention = tensor_attention
+        self.tensor_output = tensor_output
         self.prefix_cache_enabled = prefix_cache
         self.execution = (
             (
@@ -499,6 +505,7 @@ class MuseRuntime:
                 else "sequential layer placement"
             )
             + ("; sharded query/gate" if tensor_attention else "")
+            + ("; sharded vocabulary" if tensor_output else "")
             + "; greedy; single request"
         )
         if packed_cache is not None and not optimized:
@@ -519,6 +526,7 @@ class MuseRuntime:
             tensor_experts=tensor_experts,
             prefix_cache=prefix_cache,
             tensor_attention=tensor_attention,
+            tensor_output=tensor_output,
         )
         loader = load_layer
         if optimized:
@@ -608,7 +616,17 @@ class MuseRuntime:
                     if name == PREFIX + "embed_tokens.weight"
                     else devices[-1]
                 )
-                if optimized and name == "lm_head.weight":
+                if tensor_output and name == "lm_head.weight":
+                    from reap.muse_dense import TensorOutput
+
+                    self.output_head = TensorOutput(
+                        tensor,
+                        devices,
+                        self.expert_pool,
+                        multiplier=self.c.output_multiplier,
+                        softcap=self.c.final_logit_softcapping,
+                    )
+                elif optimized and name == "lm_head.weight":
                     from reap.muse_fast import native_weight
 
                     self.globals[name] = native_weight(tensor, device)
@@ -622,6 +640,8 @@ class MuseRuntime:
             self.expert_pool.shutdown(wait=True)
 
     def invalidate_graphs(self):
+        if hasattr(self, "output_head"):
+            self.output_head.execution.invalidate_graphs()
         for layer in self.layers:
             if hasattr(layer, "tensor_experts"):
                 layer.tensor_experts.invalidate_graphs()
@@ -676,12 +696,17 @@ class MuseRuntime:
         h = rms(h, self.c.rms_norm_eps, self.globals[PREFIX + "norm.weight"])
         if not all_logits:
             h = h[:, -1:]
-        logits = F.linear(h, self.globals["lm_head.weight"]) * self.c.output_multiplier
-        logits = (
-            torch.tanh(logits / self.c.final_logit_softcapping)
-            * self.c.final_logit_softcapping
-        )
-        logits = logits.cpu()
+        if hasattr(self, "output_head"):
+            logits = self.output_head.logits(h)
+        else:
+            logits = (
+                F.linear(h, self.globals["lm_head.weight"]) * self.c.output_multiplier
+            )
+            logits = (
+                torch.tanh(logits / self.c.final_logit_softcapping)
+                * self.c.final_logit_softcapping
+            )
+            logits = logits.cpu()
         if not torch.isfinite(logits).all():
             raise FloatingPointError("nonfinite Muse logits; reset the request cache")
         self.seen += len(ids)

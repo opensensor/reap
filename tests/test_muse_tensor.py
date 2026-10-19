@@ -172,6 +172,7 @@ def test_parallel_gather_preserves_expert_rows_and_uneven_column_order(
     try:
         tp = TensorExperts(ranks, pool, decode_graphs=False)
         previous_gathers = None
+        previous_results = None
         for step, repeat in enumerate((1, 1, 2, 1)):
             current = (x + step * 0.125).repeat_interleave(repeat, dim=0)
             current_ids = ids.repeat_interleave(repeat)
@@ -197,6 +198,12 @@ def test_parallel_gather_preserves_expert_rows_and_uneven_column_order(
                 if step == 1:
                     assert pointers == previous_gathers
                 previous_gathers = pointers
+                results = scope["_decode_staging"]
+                assert len(results) == 2 * len(ranks)
+                pointers = {key: value[0].data_ptr() for key, value in results.items()}
+                if step == 1:
+                    assert pointers == previous_results
+                previous_results = pointers
     finally:
         pool.shutdown()
 

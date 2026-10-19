@@ -66,6 +66,7 @@ def run(args):
                 prefill_chunk=args.prefill_chunk,
                 tensor_experts=getattr(args, "tensor_experts", False),
                 tensor_attention=getattr(args, "tensor_attention", False),
+                tensor_output=getattr(args, "tensor_output", False),
                 prefix_cache=getattr(args, "prefix_cache", False),
             )
             while True:
@@ -102,6 +103,8 @@ def run(args):
                 command.append("--deterministic")
             if getattr(args, "tensor_experts", False):
                 command.append("--tensor-experts")
+            if getattr(args, "tensor_output", False):
+                command.append("--tensor-output")
             if getattr(args, "tensor_attention", False):
                 command.append("--tensor-attention")
             if args.optimized:
@@ -213,6 +216,7 @@ def main():
     parser.add_argument("--optimized", action="store_true")
     parser.add_argument("--tensor-experts", action="store_true")
     parser.add_argument("--tensor-attention", action="store_true")
+    parser.add_argument("--tensor-output", action="store_true")
     parser.add_argument("--deterministic", action="store_true")
     parser.add_argument("--bounded-attention", action="store_true")
     parser.add_argument("--prefix-cache", action="store_true")
