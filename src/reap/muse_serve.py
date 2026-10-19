@@ -113,6 +113,18 @@ def visible_stream_text(tokenizer, tokens, chat, final=False, tools=None):
     return parse_response(text, tools, final=final) if chat else {"text": text}
 
 
+def response_usage(runtime, ids, tokens):
+    # Snapshot while the generation lock is held: another request may replace
+    # generation_stats before the response body or final SSE frame is emitted.
+    cached = getattr(runtime, "generation_stats", {}).get("cached_prompt_tokens", 0)
+    return {
+        "prompt_tokens": len(ids),
+        "completion_tokens": len(tokens),
+        "total_tokens": len(ids) + len(tokens),
+        "prompt_tokens_details": {"cached_tokens": cached},
+    }
+
+
 def streaming_response(
     runtime,
     tokenizer,
@@ -153,7 +165,7 @@ def streaming_response(
                     on_token=lambda t: send("token", t),
                     cancel=stopped,
                 )
-                result = ("done", tokens)
+                result = ("done", response_usage(runtime, ids, tokens))
             except InterruptedError:
                 pass
             except Exception as exc:
@@ -256,11 +268,7 @@ def streaming_response(
                             {
                                 **base,
                                 "choices": [],
-                                "usage": {
-                                    "prompt_tokens": len(ids),
-                                    "completion_tokens": len(tokens),
-                                    "total_tokens": len(ids) + len(tokens),
-                                },
+                                "usage": value,
                             }
                         )
                     yield "data: [DONE]\n\n"
@@ -442,6 +450,7 @@ def create_app(
         completed = False
         try:
             tokens = runtime.generate(ids, limit, eos=eos)
+            usage = response_usage(runtime, ids, tokens)
             completed = True
         finally:
             try:
@@ -483,11 +492,7 @@ def create_app(
             "created": int(time.time()),
             "model": model_name,
             "choices": [choice],
-            "usage": {
-                "prompt_tokens": len(ids),
-                "completion_tokens": len(tokens),
-                "total_tokens": len(ids) + len(tokens),
-            },
+            "usage": usage,
         }
 
     @app.post("/v1/completions")

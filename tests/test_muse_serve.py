@@ -61,6 +61,7 @@ def test_endpoint_contract_context_and_request_isolation():
         "prompt_tokens": 3,
         "completion_tokens": 2,
         "total_tokens": 5,
+        "prompt_tokens_details": {"cached_tokens": 0},
     }
     assert runtime.resets == 1
     assert runtime.call == ([1, 5, 4], 3, [2])
@@ -91,6 +92,48 @@ def test_channels_and_partial_header():
         "reasoning_content": "unfinished",
     }
     assert parse_response(" to=") == {"role": "assistant", "content": ""}
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_cache_usage_is_captured_before_request_lock_release(stream):
+    import json
+
+    class CachedRuntime(Runtime):
+        def generate(self, *args, **kwargs):
+            tokens = super().generate(*args, **kwargs)
+            self.generation_stats = {"cached_prompt_tokens": 2}
+            return tokens
+
+        def reset(self):
+            # Model cleanup or a later request must not change this response.
+            self.generation_stats = {"cached_prompt_tokens": 0}
+
+    client = TestClient(create_app(CachedRuntime(), Tokenizer(), eos=[2]))
+    response = client.post(
+        "/v1/completions",
+        json={
+            "prompt": "code",
+            "max_tokens": 3,
+            "stream": stream,
+            "stream_options": {"include_usage": True},
+        },
+    )
+    assert response.status_code == 200
+    if stream:
+        frames = [
+            json.loads(line[6:])
+            for line in response.text.splitlines()
+            if line.startswith("data: ") and line != "data: [DONE]"
+        ]
+        usage = next(frame["usage"] for frame in frames if "usage" in frame)
+    else:
+        usage = response.json()["usage"]
+    assert usage == {
+        "prompt_tokens": 3,
+        "completion_tokens": 2,
+        "total_tokens": 5,
+        "prompt_tokens_details": {"cached_tokens": 2},
+    }
 
 
 def test_real_tokenizer_chat_result_is_token_ids():
