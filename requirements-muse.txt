@@ -1,0 +1,10 @@
+# Separate from the legacy REAP environment; do not uv-sync pyproject.toml here.
+torch==2.11.0
+transformers @ git+https://github.com/huggingface/transformers.git@d4804f9d76b8c071b993d813e9e87067b780cbee
+huggingface-hub==2.2.0
+tokenizers==0.23.3
+safetensors==0.8.0
+numpy>=1.17
+accelerate>=1.7.0
+python-dotenv>=1.1.0
+pytest>=8

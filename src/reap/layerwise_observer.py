@@ -169,6 +169,13 @@ class LayerwiseMoEObserver:
         """
         self.model = model
         self.hook_config = hook_config
+        if hook_config.pruning_adapter == "muse_spark":
+            raise NotImplementedError(
+                "Legacy replay does not implement Muse's layer-specific sliding/full "
+                "attention and RoPE/NoPE handling. Use reap.muse_streaming for indexed "
+                "checkpoints, MoETransformerObserver on a materialized model, or "
+                "collect_muse_pruning_metrics on one materialized MoE."
+            )
         self._memory_cleanup_freq = 4
 
         # Auto-detect decoder blocks if not provided
