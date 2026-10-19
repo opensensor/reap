@@ -91,6 +91,21 @@ def mask_unpack(text):
     return text
 
 
+def order_tile_reuse(text):
+    """Finish the output store before the next tile overwrites shared UB."""
+    before = """        WaitFlag<HardEvent::MTE1_MTE3>(EVENT_ID4);
+      }
+      T_ = rows;"""
+    after = """        WaitFlag<HardEvent::MTE1_MTE3>(EVENT_ID4);
+        SetFlag<HardEvent::MTE3_MTE2>(EVENT_ID4);
+        WaitFlag<HardEvent::MTE3_MTE2>(EVENT_ID4);
+      }
+      T_ = rows;"""
+    if text.count(before) != 1:
+        raise ValueError("unexpected upstream tiled buffer lifecycle")
+    return text.replace(before, after)
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--qwen-source", type=Path, required=True)
@@ -131,6 +146,7 @@ def main():
             )
             if args.unpack == "mask":
                 text = mask_unpack(text)
+            text = order_tile_reuse(text)
         (inputs / name).write_text(text)
     commands = []
 
