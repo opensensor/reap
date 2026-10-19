@@ -270,3 +270,81 @@ def test_affinity_applies_only_to_decode_and_restores_prefill():
         x = torch.zeros(1, count, 16)
         assert scope["fused_layer"](layer, x) is x
     assert visits == [(), tuple(range(7)), tuple(range(7)), ()]
+
+
+@pytest.mark.parametrize("fail", [False, True])
+def test_probe_reset_restores_parent_before_server_threads_inherit_affinity(
+    monkeypatch, fail
+):
+    import os
+    from types import MethodType
+    from reap.muse_runtime import MuseRuntime
+    from reap.muse_tensor import RankPool
+    from reap.muse_resident import Resident
+    from tests.test_muse_resident import runtime
+
+    parent = 100
+    original = set(range(8))
+    masks = {parent: original.copy()}
+    monkeypatch.setattr(
+        os, "sched_setaffinity", lambda tid, cpus: masks.__setitem__(tid, set(cpus))
+    )
+    model = runtime()
+    pool = RankPool.__new__(RankPool)
+    model.expert_pool = pool
+    model.bounded_attention = False
+    model.reset = MethodType(MuseRuntime.reset, model)
+    forward = model.forward
+
+    def pinned_forward(ids, all_logits):
+        pool._muse_affinity_original = {parent: original.copy()}
+        masks[parent] = {6}
+        if fail and len(ids) == 1:
+            raise RuntimeError("injected decode failure")
+        return forward(ids, all_logits)
+
+    model.forward = pinned_forward
+    resident = Resident(model)
+    if fail:
+        with pytest.raises(RuntimeError, match="injected"):
+            resident.probe()
+    else:
+        resident.probe()
+    assert masks[parent] == original
+    assert pool._muse_affinity_original == {}
+    # This is the mask an API worker created after the startup probe inherits.
+    child_mask = masks[parent].copy()
+    assert child_mask == original
+    model.prefix_snapshot = object()
+    saved_prefix = model.prefix_snapshot
+    pool._muse_affinity_original = {parent: original.copy()}
+    masks[parent] = {6}
+    model.release_request_cache = MethodType(MuseRuntime.release_request_cache, model)
+    model.release_request_cache()
+    assert masks[parent] == original and model.prefix_snapshot is saved_prefix
+
+
+def test_affinity_cleanup_skips_exited_workers_and_remains_retryable(monkeypatch):
+    import os
+    from reap.muse_tensor import RankPool
+
+    pool = RankPool.__new__(RankPool)
+    pool._muse_affinity_original = {10: {0, 1}, 11: {0, 1}, 12: {0, 1}}
+    restored = {}
+    failure = [True]
+
+    def restore(tid, cpus):
+        if tid == 11:
+            raise ProcessLookupError("worker exited")
+        if tid == 12 and failure[0]:
+            raise OSError("injected syscall failure")
+        restored[tid] = set(cpus)
+
+    monkeypatch.setattr(os, "sched_setaffinity", restore)
+    with pytest.raises(OSError, match="injected"):
+        pool.restore_affinity()
+    assert pool._muse_affinity_original
+    failure[0] = False
+    pool.restore_affinity()
+    assert restored == {10: {0, 1}, 12: {0, 1}}
+    assert pool._muse_affinity_original == {}

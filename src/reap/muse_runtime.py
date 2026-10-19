@@ -627,6 +627,11 @@ class MuseRuntime:
                 layer.tensor_experts.invalidate_graphs()
 
     def reset(self, *, preserve_prefix=False):
+        if hasattr(self, "expert_pool"):
+            # A startup resident probe runs on the future server/event-loop
+            # thread. Leaving its decode affinity installed makes API and
+            # OpenMP workers inherit a single CPU as their "original" mask.
+            self.expert_pool.restore_affinity()
         if not preserve_prefix:
             self.prefix_snapshot = None
         if self.bounded_attention:

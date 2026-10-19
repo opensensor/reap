@@ -280,7 +280,21 @@ class RankPool:
     def submit(self, function, rank, *args):
         return self.workers[rank].submit(function, rank, *args)
 
+    def restore_affinity(self):
+        """Release decode masks before request/probe callers create children."""
+        import os
+
+        saved = getattr(self, "_muse_affinity_original", {})
+        for tid, mask in saved.items():
+            try:
+                os.sched_setaffinity(tid, mask)
+            except ProcessLookupError:
+                # Streaming workers can have exited before cache cleanup.
+                continue
+        self._muse_affinity_original = {}
+
     def shutdown(self, wait=True):
+        self.restore_affinity()
         for worker in self.workers:
             worker.shutdown(wait=wait)
 
