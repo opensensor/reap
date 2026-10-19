@@ -17,6 +17,24 @@ extern "C" __global__ __aicore__ void muse_w4_native(
   ids.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(routes));
   AscendC::GlobalTensor<int64_t> ends;
   ends.SetGlobalBuffer(reinterpret_cast<__gm__ int64_t*>(routes));
+  if (mode == 0) {
+    // Balance all routed rows together. Per-row tile rounding leaves cores
+    // idle for the 640-channel shards used by six-way tensor parallelism.
+    for (int64_t task = core; task < rows * tiles; task += cores) {
+      const int64_t row = task / tiles;
+      const uint32_t tile = task % tiles;
+      const int64_t expert = ids.GetValue(row);
+      const int64_t metadata = expert * n * (k / 128);
+      op.InitGeometry(x + row * k * sizeof(half), codes + expert * n * k / 2,
+                      scales + metadata * sizeof(half), offsets + metadata,
+                      output + row * n * sizeof(half), scratch, 1, n, k, true);
+      op.SetTileRange(tile, tiles);
+      op.SetWorkspaceTile(core);
+      op.Process();
+      AscendC::PipeBarrier<PIPE_ALL>();
+    }
+    return;
+  }
   const int64_t groups = mode == 0 ? rows : experts;
   for (int64_t group = 0; group < groups; ++group) {
     const int64_t expert = mode == 0 ? ids.GetValue(group) : group;

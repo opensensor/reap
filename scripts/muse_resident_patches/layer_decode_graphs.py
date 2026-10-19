@@ -169,8 +169,19 @@ def fused_layer(self, x, start=0, cache=None):
     from reap.muse_attention import bounded_attention
 
     graphs = self.tensor_experts.graphs
-    _, cos, sin = self.positions.get(self.c, x, start, 1)
-    phase = torch.stack((cos, sin))
+    if self.c.layer_rope_theta[self.index]:
+        _, cos, sin = self.positions.get(self.c, x, start, 1)
+        previous = getattr(self.positions, "_decode_phase", None)
+        if previous is None or previous[0] is not cos or previous[1] is not sin:
+            previous = cos, sin, torch.stack((cos, sin))
+            self.positions._decode_phase = previous
+        phase = previous[2]
+    else:
+        phase = (
+            graphs["layer-inputs"].routes
+            if "layer-inputs" in graphs
+            else x.new_empty(0)
+        )
 
     def inputs(value, phase):
         normalized = self.norm("input_layernorm", value)
@@ -234,32 +245,61 @@ def replacements():
     }
 
 
+_decode_staging = {}
+
+
+def pinned_snapshot(pool, phase, tensors):
+    # Decode copies are blocking. All futures are drained before another
+    # layer/request can overwrite these buffers on the same rank pool.
+    key = pool, phase
+    buffers = _decode_staging.get(key)
+    if buffers is None or any(
+        a.shape != b.shape or a.dtype != b.dtype for a, b in zip(buffers, tensors)
+    ):
+        buffers = tuple(
+            torch.empty(t.shape, dtype=t.dtype, device="cpu", pin_memory=True)
+            for t in tensors
+        )
+        _decode_staging[key] = buffers
+    for buffer, value in zip(buffers, tensors):
+        buffer.copy_(value)
+    return buffers
+
+
 def pipelined_project(experts, inputs, ids):
     from threading import Barrier, BrokenBarrierError
 
-    host_inputs, host_routes = inputs.cpu(), ids.cpu()
+    host_inputs, host_routes = pinned_snapshot(experts.pool, "up", (inputs, ids))
     experts.prepare_graphs(host_inputs, host_routes)
     outputs = [None] * len(experts.ranks)
     gathered = [None]
 
     def combine():
-        gathered[0] = torch.cat(outputs, dim=-1)
+        (gathered[0],) = pinned_snapshot(
+            experts.pool, "down", (torch.cat(outputs, dim=-1),)
+        )
 
     barrier = Barrier(len(experts.ranks), action=combine, timeout=60)
 
+    def host_result(i, phase, value):
+        # Rotating uneven shards have two widths. Keep both allocations so
+        # adjacent layers do not repeatedly allocate pinned host storage.
+        key = "result", i, phase, tuple(value.shape)
+        (result,) = pinned_snapshot(experts.pool, key, (value,))
+        return result
+
     def run(i):
-        rank = experts.ranks[i]
         try:
-            with torch.inference_mode(), torch.npu.device(rank.device):
-                value, routes = host_inputs.clone(), host_routes.clone()
-                outputs[i] = experts.graphs[i, "up"].run(value, routes).cpu()
+            with torch.inference_mode():
+                up = experts.graphs[i, "up"]
+                outputs[i] = host_result(i, "up", up.run(host_inputs, host_routes))
                 barrier.wait()
-                # Up and down use the same IDs on this device; avoid another
-                # host-to-device copy and its synchronization for every layer.
-                value, routes = gathered[0].clone(), experts.graphs[i, "up"].routes
-                return experts.graphs[i, "down"].run(value, routes).cpu()
+                return host_result(
+                    i, "down", experts.graphs[i, "down"].run(gathered[0], up.routes)
+                )
         except BaseException:
             barrier.abort()
+            torch.npu.synchronize(experts.ranks[i].device)
             raise
 
     futures = [experts.pool.submit(run, i) for i in range(len(experts.ranks))]
@@ -267,7 +307,7 @@ def pipelined_project(experts, inputs, ids):
     for future in futures:
         try:
             results.append(future.result())
-        except Exception as exc:
+        except BaseException as exc:
             failures.append(exc)
     if failures:
         raise next(

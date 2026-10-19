@@ -21,6 +21,76 @@ import torch_npu
 from torch.utils.cpp_extension import include_paths, library_paths
 
 
+def mask_unpack(text):
+    """Replace the pinned Qwen tiled unpack path, preserving FP16 rounding."""
+    replacements = (
+        (
+            """      // runtime index construction, weight transpose, or Gather.
+      return;""",
+            """      // runtime index construction, weight transpose, or Gather.
+      Duplicate(c16_.ReinterpretCast<uint16_t>(), static_cast<uint16_t>(0x0f0f),
+                static_cast<int32_t>(packedTileCount_ / 2));
+      Duplicate(c16_.ReinterpretCast<uint16_t>()[packedTileCount_ / 2],
+                static_cast<uint16_t>(0xf0f0), static_cast<int32_t>(packedTileCount_ / 2));
+      PipeBarrier<PIPE_V>();
+      return;""",
+        ),
+        (
+            """    Cast(cH_, cU8_, RoundMode::CAST_NONE, (int32_t)packedTileCount_);
+    PipeBarrier<PIPE_V>();
+    if (tiled_) {
+      // Load-time sign-bit toggling stores q+8 in each nibble. Extract
+      // unsigned high/low with exact FP16 arithmetic, avoiding two
+      // bit-mask/cast chains and runtime sign extension.
+      auto high = signedHalfUB_[packedTileCount_];
+      Muls(fieldHalfUB_, cH_, static_cast<half>(1.0f / 16.0f), (int32_t)packedTileCount_);
+      PipeBarrier<PIPE_V>();
+      Adds(fieldHalfUB_, fieldHalfUB_, static_cast<half>(QW4_HIGH_NIBBLE_ROUND_BIAS), (int32_t)packedTileCount_);
+      PipeBarrier<PIPE_V>();
+      Cast(c16_, fieldHalfUB_, RoundMode::CAST_RINT, (int32_t)packedTileCount_);
+      PipeBarrier<PIPE_V>();
+      Cast(high, c16_, RoundMode::CAST_NONE, (int32_t)packedTileCount_);
+      PipeBarrier<PIPE_V>();
+      Muls(fieldHalfUB_, high, static_cast<half>(16), (int32_t)packedTileCount_);
+      PipeBarrier<PIPE_V>();
+      Sub(signedHalfUB_, cH_, fieldHalfUB_, (int32_t)packedTileCount_);
+      PipeBarrier<PIPE_V>();
+    } else {
+""",
+            """    if (tiled_) {
+      // Mask both nibbles in UINT16 lanes. The high byte values are exactly
+      // representable in FP16 and division by 16 is exact. Biased-zero
+      // subtraction and scale rounding remain unchanged.
+      auto packed = cU8_.ReinterpretCast<uint16_t>();
+      auto temporary = cH_.ReinterpretCast<uint16_t>();
+      auto mask = c16_.ReinterpretCast<uint16_t>();
+      const int32_t words = static_cast<int32_t>(packedTileCount_ / 2);
+      And(temporary, packed, mask, words);
+      PipeBarrier<PIPE_V>();
+      Cast(signedHalfUB_, temporary.ReinterpretCast<uint8_t>(), RoundMode::CAST_NONE,
+           static_cast<int32_t>(packedTileCount_));
+      PipeBarrier<PIPE_V>();
+      And(temporary, packed, mask[words], words);
+      PipeBarrier<PIPE_V>();
+      Cast(signedHalfUB_[packedTileCount_], temporary.ReinterpretCast<uint8_t>(),
+           RoundMode::CAST_NONE, static_cast<int32_t>(packedTileCount_));
+      PipeBarrier<PIPE_V>();
+      Muls(signedHalfUB_[packedTileCount_], signedHalfUB_[packedTileCount_],
+           static_cast<half>(1.0f / 16.0f), static_cast<int32_t>(packedTileCount_));
+      PipeBarrier<PIPE_V>();
+    } else {
+      Cast(cH_, cU8_, RoundMode::CAST_NONE, (int32_t)packedTileCount_);
+      PipeBarrier<PIPE_V>();
+""",
+        ),
+    )
+    for old, new in replacements:
+        if text.count(old) != 1:
+            raise ValueError("unexpected upstream tiled unpack implementation")
+        text = text.replace(old, new)
+    return text
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--qwen-source", type=Path, required=True)
@@ -29,6 +99,7 @@ def main():
     p.add_argument("--output", type=Path, required=True)
     p.add_argument("--namespace", default="muse_w4_v1")
     p.add_argument("--tile", type=int, choices=(512, 1024), default=1024)
+    p.add_argument("--unpack", choices=("arithmetic", "mask"), default="arithmetic")
     args = p.parse_args()
     if not re.fullmatch(r"muse_w4_[a-zA-Z0-9_]+", args.namespace):
         p.error("namespace must start muse_w4_ and contain only identifier characters")
@@ -58,6 +129,8 @@ def main():
             text = text.replace(
                 "QW4_TILED_K_BATCH = 512;", f"QW4_TILED_K_BATCH = {args.tile};"
             )
+            if args.unpack == "mask":
+                text = mask_unpack(text)
         (inputs / name).write_text(text)
     commands = []
 
@@ -142,8 +215,13 @@ def main():
         library=dict(path=str(library), sha256=digest(library)),
         kernel=dict(path=str(binary), sha256=digest(binary)),
     )
-    (out / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
+    (out / "manifest.json").write_text(
+        json.dumps(manifest, indent=2)
+        + """
+"""
+    )
     receipt = dict(
+        unpack=args.unpack,
         commands=commands,
         torch=torch.__version__,
         torch_npu=torch_npu.__version__,
@@ -152,7 +230,11 @@ def main():
         },
         manifest=manifest,
     )
-    (out / "build-receipt.json").write_text(json.dumps(receipt, indent=2) + "\n")
+    (out / "build-receipt.json").write_text(
+        json.dumps(receipt, indent=2)
+        + """
+"""
+    )
     print(out / "manifest.json")
 
 
