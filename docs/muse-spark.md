@@ -1465,3 +1465,71 @@ text-only. The six-tool agent was configuration-validated; the executed edit
 smoke used the isolated two-tool agent. A private timestamped config backup was
 created. Larger coding tasks, the complete six-tool workflow, and further decode
 optimization remain to be evaluated.
+
+### Ordered row ownership and Kilo usage reporting (2026-10-19)
+
+A new trace samples three decode positions after a 2,127-token prompt. Summed
+six-device W4 task duration is 2.093 seconds and dense NZ matmul duration is
+0.574 seconds. These sums overlap across devices. Blocking host copies include
+pending device compute; the roughly 16 ms vocabulary-logit copy waits are not
+pure PCIe transfer time. Startup also distorts the trace's first position.
+Unprofiled controls measured 2.323/2.333 tok/s decode after the prompt.
+
+`ef23d84` lets each core retain one routed row's expert geometry and unpack
+tables across all output tiles when the routed row count equals the core count.
+The pinned Qwen header transformation orders the previous MTE3 store before
+MTE2 reuses shared buffers. The earlier unordered version failed isolated
+correctness checks; it was never used for serving. The ordered version matches
+all 21 tested shape/mode cases and 56 additional changing-input/route cases,
+including grouped prefill and narrow 672/704/1344/1408-channel banks. Its compiled
+C++ input and transformed header match the repository sources byte for byte.
+
+Three-repeat short-decode medians were 2.438 / **2.490** / 2.441 tok/s for
+control / candidate / control: **2.05% higher throughput**. After a 2,127-token
+prompt, decode was 2.314 / **2.369** / 2.327 tok/s. Cold prefill was essentially
+unchanged at 33.982 / 33.936 / 33.923 seconds. A separate pinned nonblocking
+input-copy experiment preserved output but lost 6.41% decode throughput and
+was reverted. The selected Python patch is unchanged.
+
+`151ee6e` reports `prompt_tokens_details.cached_tokens` in both normal responses
+and final SSE usage frames. Usage is captured before releasing the generation
+lock, so cleanup or a later request cannot overwrite the count. The CPU suite
+passes 150 tests, including request-local usage isolation on both response paths.
+Trace tables, receipts, and controlled measurements are in
+`../results/muse-opt-v12`; scripts are in `../runs/muse-opt-v12`.
+
+The selected frozen runtime is `runtime-ef23d84`, using native
+`muse_w4_v12_rows_ordered_k1024` and the unchanged configured Python patch
+`2a3f1bad1bc4ae7fb0fbd164d0ed78338d2351284454a022729646343a4f9a44`.
+`launch-muse-ordered-v12.sh` is the next-start launcher. All 428 files verified
+before launch; all 62 cached layers loaded without checksum failures. The new
+worker reproduced all 124 saved layer outputs exactly. Final short-decode median
+was 2.486 tok/s. Cold prefill took 34.495 seconds for 2,127 tokens; long-prompt
+decode was 2.349–2.370 tok/s and the repeated-prefix request took 8.801 seconds.
+These post-reload values are separate measurements from the controlled native
+comparison above. SSE usage matched server cache counts, and cancellation
+recovery plus three recapture cycles passed.
+
+The actual six-tool `muse-code` configuration then completed a read → edit →
+confirmation smoke in **222.768 seconds**. Its first request had 4,535 prompt
+tokens and took 84.628 seconds to prefill. Follow-up requests reused 4,096 and
+4,608 tokens; Kilo now displayed those exact cache-read counts. Only read/edit
+were exercised, and an independent execution confirmed `add(2, 3) == 5` after
+the edit. This larger prompt differs from the earlier two-tool smoke, so their
+end-to-end times are not an optimization comparison. The integration works,
+but this latency still falls short of a responsive coding assistant.
+
+A follow-up grouped-prefill trial retained geometry/unpack tables across each
+core's assigned output tiles, with the existing per-tile path preserved for
+small K where output staging overlaps those tables. All 29 shape/mode checks
+and 56 changed-input/route checks matched exactly. Standalone grouped kernels
+improved roughly 1–3%, but full-model cold prefill was 34.229 / 34.111 / 34.284
+seconds for control / candidate / control: only **0.43%** higher throughput.
+Short decode fell about **0.66%**. The trial was rejected and the selected native
+backend restored through its exact-logit gate; its evidence is retained in
+`retained-groups-performance.json`.
+
+The final idle check verified all 428 frozen files and both serving ports on
+worker 1154211. All 151 remaining threads had CPU mask 0–63; no new Ascend
+kernel errors were found since this reload. Resident weight storage identities
+were unchanged through the trials. No driver modules were replaced.
