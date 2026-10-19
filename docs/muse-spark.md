@@ -1772,3 +1772,62 @@ The observer was removed through the exact-logit gate, with the original
 Python digest and weight-storage identity restored. Neither W4A8 nor fused
 SwiGLU is enabled in serving. The next priority is adapting and qualifying this
 existing native INT4 path before writing a new dispatcher.
+
+The experimental `reap.muse_int4.NativeA8Bank` adapter and
+`scripts/qualify_muse_int4.py` now make the propagated MLP comparison repeatable.
+The adapter preserves canonical W4 codes/scales, pads only output channels,
+packs before device transfer/capture, and retains the ordered FP32 split-K sum
+of FP16 partial outputs. It is not selected by the serving runtime. Fifteen
+focused tests cover lossless encoding, weight sums, padding, symmetric-offset
+validation, nonfinite scales, split geometry, poisoned padding and accumulation
+rounding. The 166-test full suite passed before adding the four 64-alignment
+cases; all 15 adapter tests then passed, covering **170 tests** in total.
+
+The hardware qualifier verifies the packed-cache hashes and reproduces all six
+captured W4A16 MLP outputs exactly. Each candidate output includes candidate
+gate/up, the existing FP16 SiLU/multiply, candidate down, Muse's input-scaled
+expert RMS, ascending-expert weighted FP16 sum, and post-expert projection.
+
+| Layer | Cached decode relative RMS | Four-token prefill relative RMS |
+| --- | ---: | ---: |
+| 0 | 1.078% | 0.932% |
+| 31 | 0.207% | 0.284% |
+| 61 | 0.375% | 0.294% |
+
+The complete-block tests use the same captured input for control and candidate;
+they do not propagate candidate errors between layers. Full-model teacher-forced
+and coding-quality evaluation remain required. Six output shards run serially
+on one NPU for these numerical checks, so no block throughput claim is made.
+The packaged qualifier independently reproduced the prototype's six results.
+Capturing these fixtures preserved the live worker's weight identity; restoring
+its original Python patch passed the exact-logit gate.
+
+Static memory accounting found that the existing 128-channel-aligned A8 layout
+would add 3.54–3.59 GiB per device. With unchanged 98,304-token context and current
+dense/KV placement, the recorded pre-load free-memory measurements leave only
+0.66–1.53 GiB reserve, below the required 3 GiB. Reducing context is not the
+selected remedy.
+
+A direct-launch prototype reuses Qwen's native INT4 schedule, initializes its
+known-zero weight offsets in local memory, and omits resident offset tensors.
+It accepts narrower output alignments. Both the 32- and 64-channel variants
+matched the existing A8 operator exactly for 672/704/1344/1408 output channels,
+each with 8 routed decode rows and 32 grouped prefill rows; activation packing
+also matched exactly. These are A8-to-A8 checks, not parity with W4A16.
+
+The 32-channel schedule slowed the 672-output decode case to 0.582 ms, versus
+0.446 ms for padded A8. Padding that shard to 704 channels and retaining the
+64-channel schedule recovered 0.459 ms. The 64-aligned direct variant measured
+0.456/0.677/0.695 ms for the 704/1344/1408-output decode projections. These graph
+measurements include activation packing and both K partitions; they are separate
+trials from the earlier W4A16 comparisons. The direct variant is slightly slower
+than the larger vendor A8 allocation, but still materially faster than the
+recorded W4A16 projections.
+
+With 64-channel alignment and no resident offsets, additional bank storage falls
+to 0.817–0.833 GiB per device. The same recorded memory measurements then leave
+3.42–4.27 GiB reserve at 98,304 context. This is a static capacity estimate;
+full-model allocation, long-prefill shapes, changing graph inputs/routes, and
+quality/throughput gates remain outstanding. The prototype build inputs, hashes,
+scripts and binaries are retained under `opt-v15/native-a8-narrow`; serving
+continues to use the qualified W4A16 offset-eight runtime.
