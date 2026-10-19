@@ -73,7 +73,7 @@ class NativeW4:
             if (
                 e != experts
                 or n != bank.outputs
-                or n % 128
+                or n % 32
                 or not 256 <= k <= 2048
                 or k % 128
                 or q.dtype != torch.int8

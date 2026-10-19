@@ -35,6 +35,9 @@ extern "C" __global__ __aicore__ void muse_w4_native(
     }
     return;
   }
+  // Continue the round-robin assignment across nonempty expert groups.
+  // Restarting at `core` gives the same cores every partial batch of N tiles.
+  uint32_t firstTile = core;
   const int64_t groups = mode == 0 ? rows : experts;
   for (int64_t group = 0; group < groups; ++group) {
     const int64_t expert = mode == 0 ? ids.GetValue(group) : group;
@@ -42,7 +45,7 @@ extern "C" __global__ __aicore__ void muse_w4_native(
     const int64_t end = mode == 0 ? group + 1 : ends.GetValue(group);
     if (start == end) continue;
     const int64_t metadata = expert * n * (k / 128);
-    for (uint32_t tile = core; tile < tiles; tile += cores) {
+    for (uint32_t tile = firstTile; tile < tiles; tile += cores) {
       op.InitGeometry(x + start * k * sizeof(half), codes + expert * n * k / 2,
                       scales + metadata * sizeof(half), offsets + metadata,
                       output + start * n * sizeof(half), scratch,
@@ -52,5 +55,6 @@ extern "C" __global__ __aicore__ void muse_w4_native(
       op.Process();
       AscendC::PipeBarrier<PIPE_ALL>();
     }
+    firstTile = (firstTile + cores - tiles % cores) % cores;
   }
 }

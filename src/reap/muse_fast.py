@@ -122,14 +122,38 @@ class TiledBank:
                 current = x[
                     row : row + chunk, part * 2048 : part * 2048 + q.shape[-1] * 2
                 ].contiguous()
+                if expert is not None:
+                    q, scale, offset = q[expert], scale[expert], offset[expert]
+                if self.outputs % 128:
+                    # Direct-launch kernels accept complete 32-channel NZ
+                    # tiles. The vendor reference binding still requires 128.
+                    # Pad only this fallback call, retaining the narrow banks
+                    # in memory and cropping before split-K accumulation.
+                    padding = 128 - self.outputs % 128
+                    q, scale, offset = (
+                        torch.cat(
+                            (
+                                value,
+                                torch.full(
+                                    (*value.shape[:-2], padding, value.shape[-1]),
+                                    fill,
+                                    dtype=value.dtype,
+                                    device=value.device,
+                                ),
+                            ),
+                            dim=-2,
+                        )
+                        for value, fill in ((q, 0), (scale, 0), (offset, 8))
+                    )
                 if ids is None:
                     value = torch.ops._C_ascend.npu_qwen_w4_group_matmul_310(
-                        current, q[expert], scale[expert], offset[expert], True
+                        current, q, scale, offset, True
                     )
                 else:
                     value = torch.ops._C_ascend.npu_qwen_w4_routed_matmul_310(
                         current, q, scale, offset, ids[row : row + chunk].contiguous()
                     )
+                value = value[:, : self.outputs]
                 value = value.float()
                 accumulator = value if accumulator is None else accumulator + value
             outputs.append(accumulator.to(x.dtype))

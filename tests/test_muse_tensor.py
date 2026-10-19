@@ -12,27 +12,31 @@ from tests.test_muse_resident import runtime
 from reap.muse_resident import Resident
 
 
-def test_balanced_partitions_cover_channels_and_rotate_larger_shards():
+@pytest.mark.parametrize(
+    "alignment,widths", [(128, [640] * 4 + [768] * 2), (32, [672] * 4 + [704] * 2)]
+)
+def test_balanced_partitions_cover_channels_and_rotate_larger_shards(alignment, widths):
     totals = [0] * 6
     for layer in range(6):
-        cuts = partitions(4096, 6, layer)
+        cuts = partitions(4096, 6, layer, alignment=alignment)
         assert cuts[0][0] == 0 and cuts[-1][1] == 4096
         assert all(a[1] == b[0] for a, b in zip(cuts, cuts[1:]))
-        assert sorted(hi - lo for lo, hi in cuts) == [640] * 4 + [768] * 2
+        assert sorted(hi - lo for lo, hi in cuts) == widths
         totals = [n + hi - lo for n, (lo, hi) in zip(totals, cuts)]
     assert totals == [4096] * 6
     with pytest.raises(ValueError):
         partitions(256, 6)
 
 
-def test_sharding_preserves_physical_nz_codes_scales_and_gate_up_order():
+@pytest.mark.parametrize("alignment", [128, 32])
+def test_sharding_preserves_physical_nz_codes_scales_and_gate_up_order(alignment):
     torch.manual_seed(73)
     codes = torch.randint(-128, 128, (8192, 128), dtype=torch.int8)
     scales = (torch.rand(8192, 2) * 0.02).half()
     q, s = pack_tiles(codes)[None], pack_tiles(scales, scales=True)[None]
     bank = TiledBank([(q, s, torch.full_like(s, 8, dtype=torch.int8))], 256, 8192)
     expected = decode(q[0], s[0])
-    for lo, hi in partitions(4096, 6, 4):
+    for lo, hi in partitions(4096, 6, 4, alignment=alignment):
         shard = slice_bank(bank, [(lo, hi), (4096 + lo, 4096 + hi)], "cpu")
         a, b, offsets = shard.parts[0]
         assert a.is_contiguous() and b.is_contiguous() and (offsets == 8).all()
@@ -45,6 +49,64 @@ def test_sharding_preserves_physical_nz_codes_scales_and_gate_up_order():
         )
     with pytest.raises(ValueError, match="NZ"):
         slice_bank(bank, [(1, 129)], "cpu")
+
+
+@pytest.mark.parametrize("expert", [None, 1])
+def test_narrow_reference_padding_preserves_split_k_and_stored_banks(
+    monkeypatch, expert
+):
+    torch.manual_seed(83)
+    parts = []
+    for _ in range(2):
+        q = torch.stack(
+            [
+                pack_tiles(torch.randint(-128, 128, (768, 1024), dtype=torch.int8))
+                for _ in range(2)
+            ]
+        )
+        s = torch.stack(
+            [
+                pack_tiles((torch.rand(768, 16) * 0.02).half(), scales=True)
+                for _ in range(2)
+            ]
+        )
+        parts.append((q, s, torch.full_like(s, 8, dtype=torch.int8)))
+    full = TiledBank(parts, 4096, 768)
+    narrow = slice_bank(full, [(0, 672)], "cpu")
+    pointers = [t.data_ptr() for part in narrow.parts for t in part]
+    calls = []
+
+    def group(x, q, s, offset, tiled):
+        assert tiled and q.shape[0] % 128 == 0 and (offset == 8).all()
+        calls.append(q.shape)
+        return F.linear(x, decode(q, s))
+
+    def routed(x, q, s, offset, ids):
+        return torch.cat(
+            [
+                group(x[i : i + 1], q[e], s[e], offset[e], True)
+                for i, e in enumerate(ids)
+            ]
+        )
+
+    monkeypatch.setattr(
+        torch.ops._C_ascend, "npu_qwen_w4_group_matmul_310", group, raising=False
+    )
+    monkeypatch.setattr(
+        torch.ops._C_ascend, "npu_qwen_w4_routed_matmul_310", routed, raising=False
+    )
+    x = torch.randn(3, 4096).half()
+    metadata = (
+        {"expert": expert}
+        if expert is not None
+        else {"ids": torch.tensor([1, 0, 1], dtype=torch.int32)}
+    )
+    expected = full.linear(x, **metadata)[:, :672]
+    actual = narrow.linear(x, **metadata)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    assert calls and all(shape == (768, 1024) for shape in calls)
+    assert [t.data_ptr() for part in narrow.parts for t in part] == pointers
+    assert all(q.shape[1] == 672 for q, _, _ in narrow.parts)
 
 
 @pytest.mark.parametrize("grouped", [False, True])

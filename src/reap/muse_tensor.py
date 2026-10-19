@@ -224,8 +224,10 @@ def shard_layer(
         raise ValueError("unsupported expert projection geometry")
     from reap.muse_dense import QG_NAMES, TensorAttention
 
-    gate_ranges = partitions(cpu.down.inputs, len(devices), cpu.index)
-    down_ranges = partitions(cpu.down.outputs, len(devices), cpu.index)
+    # Partition at the physical NZ tile boundary. At six ranks, 128-channel
+    # rounding made the widest expert shard 768 rather than 704 channels.
+    gate_ranges = partitions(cpu.down.inputs, len(devices), cpu.index, alignment=32)
+    down_ranges = partitions(cpu.down.outputs, len(devices), cpu.index, alignment=32)
     ranks = []
     for device, (lo, hi), (down_lo, down_hi) in zip(devices, gate_ranges, down_ranges):
         middle = cpu.down.inputs
@@ -348,7 +350,9 @@ def tensor_plan(
                 cost = record["bytes"]
                 if name.endswith(".weight_scale"):
                     cost += cost // 2  # UINT4's signed-zero offsets are INT8.
-                for r, (lo, hi) in enumerate(partitions(size, ranks, index)):
+                for r, (lo, hi) in enumerate(
+                    partitions(size, ranks, index, alignment=32)
+                ):
                     experts[r] += cost * (hi - lo) // size
     for filename, shard in journal["shards"].items():
         if filename.startswith("global-"):
