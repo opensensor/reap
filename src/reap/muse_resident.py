@@ -107,6 +107,9 @@ class Resident:
             "failed": self.failed,
             "weight_storage_sha256": self.identity,
             "expert_format": "W4A8" if self.a8_manifest is not None else "W4A16",
+            "experimental_lookup_tokens": getattr(
+                self.runtime, "experimental_lookup_tokens", 0
+            ),
         }
 
     def require_ready(self):
@@ -114,6 +117,31 @@ class Resident:
             raise RuntimeError(
                 f"resident transaction failed; restart required: {self.failed}"
             )
+
+    def lookup_mode(self, *, max_proposal_tokens):
+        """Change only the decode policy; caller must hold the request lock."""
+        self.require_ready()
+        if type(max_proposal_tokens) is not int or not 0 <= max_proposal_tokens <= 7:
+            raise ValueError("max_proposal_tokens must be an integer from 0 to 7")
+        runtime = self.runtime
+        if not (
+            getattr(runtime, "optimized", False)
+            and getattr(runtime, "bounded_attention", False)
+            and hasattr(runtime, "experimental_lookup_tokens")
+        ):
+            raise ValueError(
+                "lookup mode requires a supported optimized bounded runtime"
+            )
+        previous = runtime.experimental_lookup_tokens
+        if hasattr(runtime, "execution"):
+            execution = runtime.execution.replace(
+                f"; experimental prompt lookup (up to {previous} proposals)", ""
+            )
+            if max_proposal_tokens:
+                execution += f"; experimental prompt lookup (up to {max_proposal_tokens} proposals)"
+            runtime.execution = execution
+        runtime.experimental_lookup_tokens = max_proposal_tokens
+        return self.status()
 
     def oracle(self, **options):
         """Measure known-token block verification; caller holds the request lock."""

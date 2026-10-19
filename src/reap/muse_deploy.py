@@ -115,6 +115,10 @@ def run(args):
                 command.append("--bounded-attention")
             if getattr(args, "prefix_cache", False):
                 command.append("--prefix-cache")
+            if getattr(args, "experimental_lookup_tokens", 0):
+                command.extend(
+                    ["--experimental-lookup-tokens", str(args.experimental_lookup_tokens)]
+                )
             for option in (
                 "packed_cache",
                 "resident_token_file",
@@ -222,6 +226,7 @@ def main():
     parser.add_argument("--tensor-attention", action="store_true")
     parser.add_argument("--tensor-output", action="store_true")
     parser.add_argument("--deterministic", action="store_true")
+    parser.add_argument("--experimental-lookup-tokens", type=int, choices=range(8), default=0)
     parser.add_argument("--bounded-attention", action="store_true")
     parser.add_argument("--prefix-cache", action="store_true")
     parser.add_argument("--packed-cache", type=Path)
@@ -231,6 +236,8 @@ def main():
     parser.add_argument("--experimental-a8-cache", type=Path)
     parser.add_argument("--resident-patch-file", type=Path)
     args = parser.parse_args()
+    if args.experimental_lookup_tokens and not (args.optimized and args.bounded_attention):
+        parser.error("lookup requires --optimized and --bounded-attention")
     if args.experimental_a8_cache and not args.experimental_a8_manifest:
         parser.error("--experimental-a8-cache requires --experimental-a8-manifest")
     if args.experimental_a8_manifest:

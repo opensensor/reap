@@ -1,8 +1,9 @@
 """Experimental greedy prompt-lookup decoding on an exclusively owned runtime.
 
-This is not a serving replacement. The caller must supply a reset bounded-KV
-runtime and hold its request lock. Drafts come only from prompt/accepted token
-history; there is no learned draft model. CPU algorithm tests do not establish
+The caller must hold the runtime request lock. ``generate`` prefills a reset
+runtime; ``decode`` continues an already-prefilled runtime, including a reused
+prefix. Drafts come only from prompt/accepted token history; there is no learned
+draft model. CPU algorithm tests do not establish
 hardware greedy equivalence: batched FP16/INT8 verification can change logits
 relative to single-row decoding. Qualify that numerical path before serving.
 """
@@ -82,27 +83,7 @@ def _synchronize_cache_devices(runtime):
             torch.cuda.synchronize(device)
 
 
-@torch.inference_mode()
-def generate(
-    runtime,
-    prompt_ids,
-    *,
-    max_new_tokens=32,
-    eos=(),
-    max_proposal_tokens=7,
-    min_ngram=2,
-    max_ngram=4,
-    max_index_entries=65536,
-):
-    """Return tokens and measured draft/verify/commit/fallback evidence.
-
-    Each block contains one already verified anchor plus 1, 3, or 7 proposed
-    tokens, matching the qualified B2/B4/B8 verification shapes. Commit the
-    anchor and matching proposal prefix. The retained row's
-    logits predict the replacement token on rejection or the bonus token on
-    full acceptance. EOS/the final output token remains uncached, matching the
-    ordinary runtime generator. The runtime is reset if generation fails.
-    """
+def _validate_options(runtime, prompt_ids, max_new_tokens, max_proposal_tokens, eos):
     if (
         not isinstance(prompt_ids, (list, tuple))
         or not prompt_ids
@@ -122,23 +103,64 @@ def generate(
         type(token) is not int or not 0 <= token < runtime.c.vocab_size for token in eos
     ):
         raise ValueError("invalid EOS token")
+    return eos
+
+
+def _check_cancel(cancel):
+    if cancel is not None and cancel.is_set():
+        raise InterruptedError("generation cancelled")
+
+
+@torch.inference_mode()
+def decode(
+    runtime,
+    prompt_ids,
+    logits,
+    *,
+    max_new_tokens=32,
+    eos=(),
+    max_proposal_tokens=7,
+    min_ngram=2,
+    max_ngram=4,
+    max_index_entries=65536,
+    on_token=None,
+    cancel=None,
+):
+    """Decode from the existing prompt KV/logits without another prefill.
+
+    Each block contains one already verified anchor plus 1, 3, or 7 proposed
+    tokens, matching the qualified B2/B4/B8 verification shapes. Commit the
+    anchor and matching proposal prefix. The retained row's
+    logits predict the replacement token on rejection or the bonus token on
+    full acceptance. EOS/the final output token remains uncached, matching the
+    ordinary runtime generator. Emit only accepted tokens, after successful
+    cache commit for drafted tokens. Reset on callback, cancellation or model
+    failure; the caller publishes any pending prefix only after success.
+    """
+    eos = _validate_options(
+        runtime, prompt_ids, max_new_tokens, max_proposal_tokens, eos
+    )
     if (
         not runtime.bounded_attention
-        or runtime.seen != 0
-        or getattr(runtime, "prefix_snapshot", None) is not None
+        or runtime.seen != len(prompt_ids)
         or not runtime.cache
         or any(
             not isinstance(cache, AppendCache)
-            or cache.key is not None
-            or cache.value is not None
-            or cache.seen != 0
-            or cache.length != 0
+            or cache.key is None
+            or cache.value is None
+            or cache.seen != runtime.seen
+            or not 0 <= cache.length <= cache.seen
             or cache._speculative_transaction is not None
             for cache in runtime.cache
         )
+        or not isinstance(logits, torch.Tensor)
+        or logits.ndim != 3
+        or logits.shape[0] != 1
+        or logits.shape[1] < 1
+        or logits.shape[2] != runtime.c.vocab_size
     ):
         raise ValueError(
-            "lookup generation requires an exclusively owned reset bounded-KV runtime"
+            "lookup decode requires the complete prompt KV boundary and matching logits"
         )
     lookup = PromptLookup(
         min_ngram=min_ngram, max_ngram=max_ngram, max_entries=max_index_entries
@@ -158,20 +180,20 @@ def generate(
     outputs, steps = [], []
     started = time.perf_counter()
     try:
-        for offset in range(0, len(prompt_ids), runtime.prefill_chunk):
-            logits = runtime.forward(
-                prompt_ids[offset : offset + runtime.prefill_chunk]
-            )
-        stats["prefill_seconds"] = time.perf_counter() - started
-        decode_started = time.perf_counter()
+        _check_cancel(cancel)
         draft_started = time.perf_counter()
-        for token in prompt_ids:
+        for index, token in enumerate(prompt_ids):
+            if index % 512 == 0:
+                _check_cancel(cancel)
             lookup.append(token)
         stats["draft_seconds"] += time.perf_counter() - draft_started
 
         while len(outputs) < max_new_tokens:
+            _check_cancel(cancel)
             anchor = int(logits[0, -1].argmax())
             outputs.append(anchor)
+            if on_token is not None:
+                on_token(anchor)
             draft_started = time.perf_counter()
             lookup.append(anchor)
             if anchor in eos or len(outputs) == max_new_tokens:
@@ -192,6 +214,7 @@ def generate(
             stats["draft_seconds"] += time.perf_counter() - draft_started
             block = [anchor, *proposed]
             position = runtime.seen
+            _check_cancel(cancel)
             if not proposed:
                 fallback_started = time.perf_counter()
                 logits = runtime.forward(block, all_logits=True)
@@ -220,6 +243,7 @@ def generate(
                 stats["verification_seconds"] += verify_elapsed
                 stats["verification_calls"] += 1
                 stats["proposed_tokens"] += len(proposed)
+                _check_cancel(cancel)
                 acceptance_started = time.perf_counter()
                 predictions = verified[0].argmax(dim=-1).tolist()
                 matched = 0
@@ -241,11 +265,14 @@ def generate(
                 stats["commit_seconds"] += commit_elapsed
             stats["accepted_draft_tokens"] += matched
             stats["committed_input_tokens"] += committed
-            draft_started = time.perf_counter()
             for token in proposed[:matched]:
+                _check_cancel(cancel)
+                draft_started = time.perf_counter()
                 outputs.append(token)
                 lookup.append(token)
-            stats["draft_seconds"] += time.perf_counter() - draft_started
+                stats["draft_seconds"] += time.perf_counter() - draft_started
+                if on_token is not None:
+                    on_token(token)
             steps.append(
                 {
                     "start": position,
@@ -265,8 +292,9 @@ def generate(
             cache.seen != runtime.seen for cache in runtime.cache
         ):
             raise RuntimeError("lookup generation left inconsistent cache positions")
-        stats["decode_seconds"] = time.perf_counter() - decode_started
-        stats["total_seconds"] = time.perf_counter() - started
+        _check_cancel(cancel)
+        stats["decode_seconds"] = time.perf_counter() - started
+        stats["total_seconds"] = stats["decode_seconds"]
         stats["completion_tokens"] = len(outputs)
         stats["prompt_tokens"] = len(prompt_ids)
         stats["acceptance_rate"] = (
@@ -282,6 +310,76 @@ def generate(
             "supported_block_rows": [1, 2, 4, 8],
             "hardware_greedy_equivalence_proven": False,
         }
-    except Exception:
+    except BaseException:
+        runtime.reset()
+        raise
+
+
+@torch.inference_mode()
+def generate(
+    runtime,
+    prompt_ids,
+    *,
+    max_new_tokens=32,
+    eos=(),
+    max_proposal_tokens=7,
+    min_ngram=2,
+    max_ngram=4,
+    max_index_entries=65536,
+    on_token=None,
+    cancel=None,
+):
+    """Standalone research entry point: prefill once, then use shared decode."""
+    eos = _validate_options(
+        runtime, prompt_ids, max_new_tokens, max_proposal_tokens, eos
+    )
+    # Validate index options before prefill, preserving the standalone API's
+    # fail-before-mutation contract. decode builds the actual index afterward.
+    PromptLookup(
+        min_ngram=min_ngram, max_ngram=max_ngram, max_entries=max_index_entries
+    )
+    if (
+        not runtime.bounded_attention
+        or runtime.seen != 0
+        or getattr(runtime, "prefix_snapshot", None) is not None
+        or not runtime.cache
+        or any(
+            not isinstance(cache, AppendCache)
+            or cache.key is not None
+            or cache.value is not None
+            or cache.seen != 0
+            or cache.length != 0
+            or cache._speculative_transaction is not None
+            for cache in runtime.cache
+        )
+    ):
+        raise ValueError(
+            "lookup generation requires an exclusively owned reset bounded-KV runtime"
+        )
+    started = time.perf_counter()
+    try:
+        for offset in range(0, len(prompt_ids), runtime.prefill_chunk):
+            _check_cancel(cancel)
+            logits = runtime.forward(
+                prompt_ids[offset : offset + runtime.prefill_chunk]
+            )
+        prefill_seconds = time.perf_counter() - started
+        result = decode(
+            runtime,
+            prompt_ids,
+            logits,
+            max_new_tokens=max_new_tokens,
+            eos=eos,
+            max_proposal_tokens=max_proposal_tokens,
+            min_ngram=min_ngram,
+            max_ngram=max_ngram,
+            max_index_entries=max_index_entries,
+            on_token=on_token,
+            cancel=cancel,
+        )
+        result["stats"]["prefill_seconds"] = prefill_seconds
+        result["stats"]["total_seconds"] = time.perf_counter() - started
+        return result
+    except BaseException:
         runtime.reset()
         raise

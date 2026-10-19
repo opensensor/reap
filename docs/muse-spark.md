@@ -2086,3 +2086,37 @@ shares the generation lock, resets before and after each experiment, and
 checks resident weight-storage identity even on failure. It is a research
 endpoint; ordinary chat generation is unchanged. A learned DFlash model is
 not used, and full-model token equivalence must be checked for each trial.
+
+The first actual lookup trial on six 310Ps produced 64 tokens per fixture with
+all real token IDs matching plain decoding before and after each candidate:
+
+| Fixture | Plain decode tok/s | Lookup decode tok/s | Speedup | Draft acceptance |
+| --- | ---: | ---: | ---: | ---: |
+| Short code | 3.43 | 5.08 | 1.48x | 46.7% |
+| Repetitive code | 3.30 | 6.25 | 1.90x | 50.0% |
+| Code after 4,254 prompt tokens | 3.08 | 8.76 | 2.84x | 80.0% |
+
+Rates count the 63 tokens requiring decode work; the first token comes from
+prefill. The plain control averages bracketing decode times. Candidate timings
+include lookup, acceptance, synchronization, and cache commits; captures and
+the two same-input qualification comparisons were warmed before measurement.
+The long candidate spent 0.167 seconds committing KV across ten verification
+calls. Cold prefill remained about 68 seconds, so these are decode speedups,
+not end-to-end gains of the same magnitude. This is one sample per arm on
+three fixtures, not broad coding-quality validation. Evidence is in v20
+`lookup-results.json` and `lookup-summary.json`.
+
+`--experimental-lookup-tokens 7` opts serving into this decoder while retaining
+the existing prompt-prefix cache, token callbacks, cancellation, and tool/SSE
+handling. It requires optimized bounded attention; zero (the default) retains
+ordinary decoding. Select `layer_verification_graphs_v1.py` explicitly for the
+qualified block graph path. The health response reports the proposal cap, and
+generation events include lookup cost/acceptance details. A failed or cancelled
+lookup request discards its pending prefix snapshot. CPU tests cover prefix
+reuse with changed suffixes and callback/cancellation failures; enabling this
+option alone does not establish hardware equivalence on arbitrary prompts.
+The authenticated `POST /resident/lookup-mode` action takes exactly
+`{"max_proposal_tokens": 0}` through `7` and changes the policy under the same
+request lock. It preserves the prompt prefix and loaded weights, so controlled
+plain/lookup comparisons do not require another model reload. Startup still
+uses the explicitly selected command-line value.

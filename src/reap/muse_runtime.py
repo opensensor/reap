@@ -475,8 +475,18 @@ class MuseRuntime:
         prefix_cache=False,
         experimental_a8_manifest=None,
         experimental_a8_cache=None,
+        experimental_lookup_tokens=0,
     ):
         self.root = Path(root)
+        if (
+            type(experimental_lookup_tokens) is not int
+            or not 0 <= experimental_lookup_tokens <= 7
+            or (experimental_lookup_tokens and not (optimized and bounded_attention))
+        ):
+            raise ValueError(
+                "experimental lookup requires 0..7 proposals and optimized bounded attention"
+            )
+        self.experimental_lookup_tokens = experimental_lookup_tokens
         # Explicit opt-in; resident swaps remain within this weight/activation ABI.
         self.experimental_a8_manifest = experimental_a8_manifest
         if experimental_a8_cache is not None and experimental_a8_manifest is None:
@@ -522,6 +532,8 @@ class MuseRuntime:
             + ("; sharded vocabulary" if tensor_output else "")
             + "; greedy; single request"
         )
+        if experimental_lookup_tokens:
+            self.execution += f"; experimental prompt lookup (up to {experimental_lookup_tokens} proposals)"
         if packed_cache is not None and not optimized:
             raise ValueError("packed cache requires optimized mode")
         self.bounded_attention = bounded_attention
@@ -753,6 +765,29 @@ class MuseRuntime:
         return logits
 
     def generate(self, ids, max_new_tokens=32, eos=(), *, on_token=None, cancel=None):
+        lookup_tokens = getattr(self, "experimental_lookup_tokens", 0)
+        if (
+            type(lookup_tokens) is not int
+            or not 0 <= lookup_tokens <= 7
+            or (lookup_tokens and not (self.optimized and self.bounded_attention))
+        ):
+            raise ValueError("invalid experimental lookup runtime configuration")
+        if not lookup_tokens:
+            return self._generate(
+                ids, max_new_tokens, eos, on_token=on_token, cancel=cancel
+            )
+        try:
+            return self._generate(
+                ids, max_new_tokens, eos, on_token=on_token, cancel=cancel
+            )
+        except BaseException:
+            # No failed/cancelled lookup request may publish or retain a prefix
+            # snapshot, including failures during the shared prefill phase.
+            self.reset()
+            self.generation_stats = {}
+            raise
+
+    def _generate(self, ids, max_new_tokens=32, eos=(), *, on_token=None, cancel=None):
         if (
             not ids
             or max_new_tokens < 1
@@ -804,27 +839,61 @@ class MuseRuntime:
                 )
             )
         prefill_seconds = time.monotonic() - started
-        result = []
-        for step in range(max_new_tokens):
-            if cancel is not None and cancel.is_set():
-                raise InterruptedError("generation cancelled")
-            token = int(logits[0, -1].argmax())
-            result.append(token)
-            if on_token is not None:
-                on_token(token)
-            if len(result) % 16 == 0:
-                self.progress(
-                    json.dumps(
-                        {
-                            "event": "decode_progress",
-                            "tokens": len(result),
-                            "seconds": time.monotonic() - started,
-                        }
+        lookup_result = None
+        if getattr(self, "experimental_lookup_tokens", 0):
+            from reap.muse_lookup import decode
+
+            emitted = 0
+
+            def emit(token):
+                nonlocal emitted
+                emitted += 1
+                if on_token is not None:
+                    on_token(token)
+                if emitted % 16 == 0:
+                    self.progress(
+                        json.dumps(
+                            {
+                                "event": "decode_progress",
+                                "tokens": emitted,
+                                "seconds": time.monotonic() - started,
+                            }
+                        )
                     )
-                )
-            if token in eos or step == max_new_tokens - 1:
-                break
-            logits = self.forward([token])
+
+            lookup_result = decode(
+                self,
+                ids,
+                logits,
+                max_new_tokens=max_new_tokens,
+                eos=eos,
+                max_proposal_tokens=self.experimental_lookup_tokens,
+                on_token=emit,
+                cancel=cancel,
+            )
+            result = lookup_result["tokens"]
+        else:
+            result = []
+            for step in range(max_new_tokens):
+                if cancel is not None and cancel.is_set():
+                    raise InterruptedError("generation cancelled")
+                token = int(logits[0, -1].argmax())
+                result.append(token)
+                if on_token is not None:
+                    on_token(token)
+                if len(result) % 16 == 0:
+                    self.progress(
+                        json.dumps(
+                            {
+                                "event": "decode_progress",
+                                "tokens": len(result),
+                                "seconds": time.monotonic() - started,
+                            }
+                        )
+                    )
+                if token in eos or step == max_new_tokens - 1:
+                    break
+                logits = self.forward([token])
         total_seconds = time.monotonic() - started
         self.prefix_snapshot = pending_prefix
         self.generation_stats = {
@@ -835,6 +904,8 @@ class MuseRuntime:
             "decode_seconds": total_seconds - prefill_seconds,
             "total_seconds": total_seconds,
         }
+        if lookup_result is not None:
+            self.generation_stats["lookup"] = lookup_result["stats"]
         self.progress(
             json.dumps({"event": "generation_complete", **self.generation_stats})
         )
@@ -851,12 +922,21 @@ def main():
     parser.add_argument("--plan-only", action="store_true")
     parser.add_argument("--optimized", action="store_true")
     parser.add_argument("--bounded-attention", action="store_true")
+    parser.add_argument(
+        "--experimental-lookup-tokens", type=int, choices=range(8), default=0
+    )
     parser.add_argument("--library", type=Path)
     parser.add_argument("--input-ids", type=int, nargs="+")
     parser.add_argument("--max-new-tokens", type=int, default=16)
     args = parser.parse_args()
     if args.bounded_attention and (not args.optimized or args.max_context < 1):
         parser.error("--bounded-attention requires --optimized and positive context")
+    if args.experimental_lookup_tokens and not (
+        args.optimized and args.bounded_attention
+    ):
+        parser.error(
+            "--experimental-lookup-tokens requires optimized bounded attention"
+        )
     if args.plan_only:
         print(
             json.dumps(
@@ -892,6 +972,7 @@ def main():
         reserve_gib=args.reserve_gib,
         optimized=args.optimized,
         bounded_attention=args.bounded_attention,
+        experimental_lookup_tokens=args.experimental_lookup_tokens,
     )
     generation = (
         json.loads((args.model / "generation_config.json").read_text())

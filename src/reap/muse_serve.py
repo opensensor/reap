@@ -338,6 +338,9 @@ def create_app(
             "bounded_attention": getattr(runtime, "bounded_attention", False),
             "prefill_chunk": getattr(runtime, "prefill_chunk", None),
             "prefix_cache": getattr(runtime, "prefix_cache_enabled", False),
+            "experimental_lookup_tokens": getattr(
+                runtime, "experimental_lookup_tokens", 0
+            ),
             "tensor_output": getattr(runtime, "tensor_output", False),
             "deterministic": getattr(runtime, "deterministic", False),
             "streaming": True,
@@ -367,11 +370,23 @@ def create_app(
         @app.post("/resident/{action}")
         def resident_action(action: str, body: dict, request: HTTPRequest):
             authorize(request)
-            if action not in ("load-native", "switch", "oracle", "lookup"):
+            if action not in (
+                "load-native",
+                "switch",
+                "oracle",
+                "lookup",
+                "lookup-mode",
+            ):
                 raise HTTPException(404, "unknown resident action")
             if not lock.acquire(blocking=False):
                 raise HTTPException(503, "runtime is handling another request")
             try:
+                if action == "lookup-mode":
+                    if set(body) != {"max_proposal_tokens"}:
+                        raise ValueError(
+                            "lookup-mode requires only max_proposal_tokens"
+                        )
+                    return resident.lookup_mode(**body)
                 if action == "load-native":
                     return resident.load_native(body)
                 if action == "lookup":
@@ -408,7 +423,8 @@ def create_app(
                 raise HTTPException(400, str(exc)) from exc
             finally:
                 try:
-                    runtime.reset()
+                    if action != "lookup-mode":
+                        runtime.reset()
                 finally:
                     lock.release()
 
@@ -574,6 +590,9 @@ def main():
     parser.add_argument("--tensor-attention", action="store_true")
     parser.add_argument("--tensor-output", action="store_true")
     parser.add_argument("--deterministic", action="store_true")
+    parser.add_argument(
+        "--experimental-lookup-tokens", type=int, choices=range(8), default=0
+    )
     parser.add_argument("--bounded-attention", action="store_true")
     parser.add_argument("--prefix-cache", action="store_true")
     parser.add_argument("--packed-cache", type=Path)
@@ -583,6 +602,10 @@ def main():
     parser.add_argument("--experimental-a8-cache", type=Path)
     parser.add_argument("--resident-patch-file", type=Path)
     args = parser.parse_args()
+    if args.experimental_lookup_tokens and not (
+        args.optimized and args.bounded_attention
+    ):
+        parser.error("lookup requires --optimized and --bounded-attention")
     if args.bounded_attention and (not args.optimized or args.max_context < 1):
         parser.error("--bounded-attention requires --optimized and positive context")
     if args.resident_token_file and not args.optimized:
@@ -646,6 +669,7 @@ def main():
         tensor_attention=args.tensor_attention,
         tensor_output=args.tensor_output,
         prefix_cache=args.prefix_cache,
+        experimental_lookup_tokens=args.experimental_lookup_tokens,
         experimental_a8_manifest=a8_manifest,
         experimental_a8_cache=args.experimental_a8_cache,
     )
