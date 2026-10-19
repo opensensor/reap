@@ -92,6 +92,82 @@ def test_local_control_auth_and_failure_blocks_inference():
     assert local.post("/resident/switch", json={}, headers=headers).status_code == 400
 
 
+def test_oracle_control_auth_validation_and_request_lock(monkeypatch):
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+
+    r = Resident(runtime())
+    token = "x" * 40
+    app = create_app(r.runtime, Tokenizer(), eos=[2], resident=r, resident_token=token)
+    local = TestClient(app, client=("127.0.0.1", 12345))
+    remote = TestClient(app, client=("192.0.2.1", 12345))
+    headers = {"Authorization": "Bearer " + token}
+    body = {"prompt": "code", "max_tokens": 8, "block_sizes": [1, 4]}
+    entered, release = threading.Event(), threading.Event()
+    calls = []
+
+    def oracle(**options):
+        calls.append(options)
+        entered.set()
+        assert release.wait(5)
+        return {"completed": True}
+
+    monkeypatch.setattr(r, "oracle", oracle)
+    assert local.post("/resident/oracle", json=body).status_code == 403
+    assert (
+        remote.post("/resident/oracle", json=body, headers=headers).status_code == 403
+    )
+    for invalid in ({}, {"prompt": ""}, {**body, "source": "bad"}):
+        assert (
+            local.post("/resident/oracle", json=invalid, headers=headers).status_code
+            == 400
+        )
+    with ThreadPoolExecutor() as pool:
+        pending = pool.submit(
+            local.post, "/resident/oracle", json=body, headers=headers
+        )
+        try:
+            assert entered.wait(5)
+            assert (
+                local.post(
+                    "/v1/completions", json={"prompt": "a", "max_tokens": 2}
+                ).status_code
+                == 503
+            )
+            assert (
+                local.post("/resident/oracle", json=body, headers=headers).status_code
+                == 503
+            )
+        finally:
+            release.set()
+        assert pending.result().status_code == 200
+    assert calls == [{"prompt_ids": [1, 4, 5], "max_tokens": 8, "block_sizes": [1, 4]}]
+    assert (
+        local.post("/v1/completions", json={"prompt": "a", "max_tokens": 2}).status_code
+        == 200
+    )
+
+
+def test_oracle_failure_cleans_runtime_and_checks_readiness(monkeypatch):
+    import reap.muse_speculative as module
+
+    r = Resident(runtime())
+    resets = []
+    monkeypatch.setattr(r.runtime, "reset", lambda: resets.append(True))
+
+    def fail(*args, **kwargs):
+        raise ValueError("invalid benchmark")
+
+    monkeypatch.setattr(module, "benchmark", fail)
+    with pytest.raises(ValueError, match="invalid benchmark"):
+        r.oracle(prompt_ids=[1])
+    assert len(resets) == 2
+    r.failed = "device fault"
+    with pytest.raises(RuntimeError, match="restart required"):
+        r.oracle(prompt_ids=[1])
+    assert len(resets) == 2
+
+
 def test_native_preflight_and_partial_failure(monkeypatch):
     import reap.muse_resident as module
 

@@ -1973,3 +1973,32 @@ missing launch counts exactly match their dense-stage starting offsets. New
 profiling explicitly activates every device inside the capture and verifies
 per-device kernel counts before treating a trace as a complete breakdown.
 Profiler timings are kept separate from the clean throughput measurements.
+
+The corrected v18 traces contain all 744 native expert launches per device for
+three decode passes, and all 16 per device for four late-prefill layers. Across
+three decode passes, accumulated dense FP16 matmul time is 610 ms and native
+expert time is 464 ms. These sums overlap across chips and are not wall-time
+percentages. The four measured prefill layers route 4,096 rows to 24–29 experts,
+with maximum group sizes of 256–384; uniform synthetic groups alone do not
+represent this workload.
+
+### Speculative verification ceiling
+
+The authenticated, loopback-only `POST /resident/oracle` action accepts a text
+`prompt`, `block_sizes` (default `[1, 2, 4, 8]`), `repeats` (default 3), and
+`max_tokens` (default 16). It holds the same request lock as generation, clears
+request/prefix caches, and uses the current resident weights and kernels.
+The output records a sequentially generated token tape and full-logit/argmax
+comparisons for repeated causal block evaluation, bracketed by sequential
+controls. A block of B rows represents one pending token and B−1 proposals.
+Only live sliding KV is copied between trials; full-attention allocations remain
+shared. The runtime is reset on success and failure.
+
+This measures a perfect-draft, all-accepted ceiling. It excludes draft cost,
+acceptance decisions, snapshot restoration and rejection rollback; it is not
+a speculative serving implementation. Numerical differences from changed
+matrix shapes are reported rather than hidden. Real rejection rollback needs
+to defer sliding-cache compaction until the accepted prefix is committed;
+decrementing cache lengths after compaction loses necessary history. Matching
+Qwen DFlash2 weights cannot be attached to Muse Spark REAP without a compatible
+trained drafter.

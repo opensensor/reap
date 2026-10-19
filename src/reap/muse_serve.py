@@ -355,21 +355,33 @@ def create_app(
         @app.post("/resident/{action}")
         def resident_action(action: str, body: dict, request: HTTPRequest):
             authorize(request)
-            if action not in ("load-native", "switch"):
+            if action not in ("load-native", "switch", "oracle"):
                 raise HTTPException(404, "unknown resident action")
             if not lock.acquire(blocking=False):
                 raise HTTPException(503, "runtime is handling another request")
             try:
                 if action == "load-native":
                     return resident.load_native(body)
+                if action == "oracle":
+                    if set(body) - {"prompt", "block_sizes", "repeats", "max_tokens"}:
+                        raise ValueError("unknown oracle fields")
+                    prompt = body.get("prompt")
+                    if not isinstance(prompt, str) or not prompt:
+                        raise ValueError("oracle requires a nonempty prompt")
+                    options = {k: v for k, v in body.items() if k != "prompt"}
+                    return resident.oracle(
+                        prompt_ids=tokenizer.encode(prompt), **options
+                    )
                 if set(body) - {"native", "source"}:
                     raise ValueError("unknown switch fields")
                 return resident.switch(**body)
             except Exception as exc:
                 raise HTTPException(400, str(exc)) from exc
             finally:
-                runtime.reset()
-                lock.release()
+                try:
+                    runtime.reset()
+                finally:
+                    lock.release()
 
     @app.get("/v1/models")
     def models():

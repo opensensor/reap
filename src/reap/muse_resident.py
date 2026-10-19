@@ -115,6 +115,22 @@ class Resident:
                 f"resident transaction failed; restart required: {self.failed}"
             )
 
+    def oracle(self, **options):
+        """Measure known-token block verification; caller holds the request lock."""
+        from reap.muse_speculative import benchmark
+
+        self.require_ready()
+        self.runtime.reset()
+        try:
+            result = benchmark(self.runtime, **options)
+            self.synchronize()
+            if self.storage_identity() != self.identity:
+                self.failed = "oracle benchmark changed resident weight storage"
+                raise RuntimeError(self.failed)
+            return {**self.status(), "benchmark": result}
+        finally:
+            self.runtime.reset()
+
     def load_native(self, manifest):
         self.require_ready()
         checker, factory = check_manifest, NativeW4
