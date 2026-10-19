@@ -1,10 +1,20 @@
 from types import SimpleNamespace
+from collections import OrderedDict
+import hashlib
+from threading import RLock
 
 import pytest
 import torch
 
 from reap.muse_fast import pack_tiles
-from reap.muse_int4 import NativeA8Bank, canonical_codes, pack_part
+from reap.muse_int4 import (
+    DirectA8,
+    DirectA8Bank,
+    NativeA8Bank,
+    canonical_codes,
+    check_direct_manifest,
+    pack_part,
+)
 
 
 @pytest.mark.parametrize("n,k", [(32, 256), (672, 2048), (704, 512), (1408, 1024)])
@@ -102,3 +112,187 @@ def test_native_adapter_preserves_split_sum_and_crops_padding(monkeypatch):
     )
     with pytest.raises(ValueError, match="route geometry"):
         bank.linear(x, ids=routes.long())
+
+
+def test_direct_manifest_checks_quantizer_before_loading(tmp_path, monkeypatch):
+    files = {}
+    for name in ("library", "kernel", "quantizer"):
+        p = tmp_path / name
+        p.write_bytes(name.encode())
+        files[name] = dict(
+            path=str(p), sha256=hashlib.sha256(p.read_bytes()).hexdigest()
+        )
+    manifest = dict(
+        name="muse_a8_test",
+        namespace="muse_a8_test",
+        abi="muse-w4a8-zero64-v1",
+        **files,
+    )
+    assert check_direct_manifest(manifest)
+    loaded = []
+    monkeypatch.setattr(torch.ops, "load_library", loaded.append)
+    (tmp_path / "quantizer").write_bytes(b"changed")
+    with pytest.raises(ValueError, match="quantizer hash mismatch"):
+        DirectA8(manifest, [])
+    assert not loaded
+
+
+def test_direct_bank_omits_offsets_and_accounts_padding():
+    q = torch.zeros(1, 672, 128, dtype=torch.int8)
+    s = torch.ones(1, 672, 2, dtype=torch.float16)
+    o = torch.full_like(s, 8, dtype=torch.int8)
+    bank = DirectA8Bank(
+        SimpleNamespace(inputs=256, outputs=672, parts=[(q, s, o)]), "cpu", None
+    )
+    assert len(bank.parts[0]) == 3
+    assert bank.parts[0][0].shape == (1, 704, 128)
+    assert (
+        sum(v.numel() * v.element_size() for v in bank.parts[0])
+        == 704 * 256 * (64 + 4) // 128
+    )
+
+
+def test_direct_launch_descriptor_crop_and_geometry_lifetime():
+    backend = DirectA8.__new__(DirectA8)
+    device = torch.device("cpu")
+    backend.kernels = {device: ("matmul", "pack")}
+    backend.empty = {device: torch.empty(0, dtype=torch.uint8)}
+    backend.geometry = OrderedDict()
+    backend.geometry_lock = RLock()
+    q = torch.zeros(1, 64, 128, dtype=torch.int8)
+    scale = torch.ones(1, 64, 2, dtype=torch.float16)
+    bank = SimpleNamespace(inputs=512, outputs=32, parts=[(q, scale, scale)] * 2)
+    inputs = torch.ones(8, 512, dtype=torch.float16)
+    routes = torch.zeros(8, dtype=torch.int32)
+    calls = []
+
+    def launch(kernel, arguments, cores):
+        calls.append(kernel)
+        assert cores == 8
+        if kernel == "pack":
+            assert arguments[-1].tolist() == [16]
+            for t in arguments[1:5]:
+                t.zero_()
+        else:
+            assert arguments[-1].tolist() == [8, 1, 64, 256, 8, 1, 1]
+            assert arguments[7] is routes
+            arguments[8].fill_(2)
+            arguments[8][:, 32:] = float("nan")
+
+    backend.launch = launch
+    assert torch.equal(
+        backend.linear(bank, inputs, ids=routes),
+        torch.full((8, 32), 4, dtype=torch.float16),
+    )
+    assert calls == ["pack", "matmul", "pack", "matmul"]
+    # Graph owners retain these tensors even after varied prefill evicts the LRU.
+    retained = tuple(backend.geometry.values())
+    for i in range(300):
+        backend.metadata((device, i + 20, 0, 256, 0, -1), [i])
+    assert len(backend.geometry) == 256
+    assert retained[0].tolist() == [16]
+    assert retained[1].tolist() == [8, 1, 64, 256, 8, 1, 1]
+    calls.clear()
+    bank.inputs = 768
+    with pytest.raises(ValueError, match="split geometry"):
+        backend.linear(bank, inputs, ids=routes)
+    assert not calls
+
+
+def test_experimental_a8_cannot_enter_w4_resident_switch_controls():
+    from reap.muse_resident import Resident
+
+    with pytest.raises(ValueError, match="offline-only"):
+        Resident(SimpleNamespace(experimental_a8_manifest={}))
+
+
+def test_direct_builder_refuses_changed_upstream_anchors():
+    import runpy
+    from pathlib import Path
+
+    builder = runpy.run_path(
+        str(Path(__file__).parents[1] / "scripts/muse_native/build_int4.py")
+    )
+    offset = "        DataCopy(metadata[N], zw_[index], metadataCopy);"
+    assert "Duplicate(metadata[N]" in builder["zero_offsets"](offset)
+    for text in ("", offset + offset):
+        with pytest.raises(ValueError, match="offset load"):
+            builder["zero_offsets"](text)
+    pack = "KERNEL_TYPE_AIC_ONLY\n  auto td = reinterpret_cast<__gm__ PackTiling*>(tiling);"
+    assert "InitSocState" in builder["direct_quantizer"](pack)
+    for text in ("", pack + pack):
+        with pytest.raises(ValueError, match="pack entry"):
+            builder["direct_quantizer"](text)
+
+
+def test_a8_plan_matches_actual_sharded_allocations_and_preserves_kv(monkeypatch):
+    from reap.muse_fast import TiledBank
+    from reap.muse_runtime import placement_plan
+    from reap.muse_tensor import shard_layer, tensor_plan
+
+    with pytest.raises(ValueError, match="optimized tensor experts"):
+        placement_plan("unused", ["cpu"], experimental_a8=True)
+    monkeypatch.setattr(
+        "reap.muse_tensor.native_weight", lambda value, device: value.to(device)
+    )
+    c = SimpleNamespace(
+        num_hidden_layers=6,
+        moe_hidden_size=256,
+        moe_intermediate_size=256,
+        sliding_window=2048,
+        num_key_value_heads=2,
+        head_dim=64,
+        layer_types=["sliding_attention", "full_attention"] * 3,
+    )
+
+    def bank(n):
+        q = torch.zeros(2, n, 128, dtype=torch.int8)
+        s = torch.ones(2, n, 2, dtype=torch.float16)
+        return TiledBank([(q, s, torch.full_like(s, 8, dtype=torch.int8))], 256, n)
+
+    shards, expected = {}, [0] * 6
+    backend = object()
+    for index in range(6):
+        cpu = SimpleNamespace(
+            c=c,
+            index=index,
+            w={"input_layernorm.weight": torch.zeros(256).half()},
+            gate_up=bank(512),
+            down=bank(256),
+        )
+        layer = shard_layer(cpu, ["cpu"] * 6, "cpu", None, expert_backend=backend)
+        for rank, r in enumerate(layer.tensor_experts.ranks):
+            assert r.gate_up.backend is backend and r.down.backend is backend
+            expected[rank] += sum(
+                v.numel() * v.element_size()
+                for b in (r.gate_up, r.down)
+                for part in b.parts
+                for v in part
+            )
+        shards[f"dense-{index:03d}.safetensors"] = {"tensors": {"norm": {"bytes": 512}}}
+        for ep in (0, 1):
+            tensors = {}
+            for projection in ("gate", "up", "down"):
+                name = f"mlp.experts.{ep}.{projection}_proj"
+                tensors[name + ".weight"] = {"bytes": 256 * 128}
+                tensors[name + ".weight_scale"] = {"bytes": 256 * 2 * 2}
+            shards[f"experts-{index:03d}-ep{ep}.safetensors"] = {"tensors": tensors}
+    stages = [dict(device=f"npu:{r}") for r in range(6)]
+    base = tensor_plan(c, {"shards": shards}, stages, 98304, 512, 3, prefix_cache=True)
+    candidate = tensor_plan(
+        c,
+        {"shards": shards},
+        stages,
+        98304,
+        512,
+        3,
+        prefix_cache=True,
+        experimental_a8=True,
+    )
+    assert [p["expert_shard_bytes"] for p in candidate] == expected
+    assert sum(p["dense_and_kv_bytes"] for p in base) == sum(
+        p["dense_and_kv_bytes"] for p in candidate
+    )
+    assert all(
+        p["required_bytes"] - p["weights_and_kv_bytes"] == 3 * 2**30 for p in candidate
+    )

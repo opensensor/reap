@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Compare propagated W4A8 errors with captured, complete Muse MLP outputs.
 
-Run with CANN and the Qwen A8 OPP sourced and PYTHONPATH=src. Captures must
+Run with CANN and PYTHONPATH=src. The vendor candidate needs the Qwen A8
+OPP; --direct-a8-manifest needs only the serving W4 control OPP. Captures must
 contain block-{layer}-{1,4}.pt with x, output, and CPU mlp weights. Only trusted
 locally generated captures are accepted by convention; loading uses weights_only.
 All six output shards execute serially on one device to bound device memory.
@@ -21,7 +22,7 @@ from safetensors.torch import load_file
 from reap.muse_fast import FastMuseLayer, TiledBank, native_weight
 from reap.muse_runtime import configuration
 from reap.muse_tensor import partitions
-from reap.muse_int4 import NativeA8Bank
+from reap.muse_int4 import DirectA8, DirectA8Bank, NativeA8Bank, check_direct_manifest
 from reap.muse_native import NativeW4, check_manifest
 from reap.muse_packed import identity
 
@@ -30,6 +31,11 @@ parser.add_argument("--model", type=Path, required=True)
 parser.add_argument("--captures", type=Path, required=True)
 parser.add_argument("--packed-cache", type=Path, required=True)
 parser.add_argument("--native-manifest", type=Path, required=True)
+parser.add_argument(
+    "--direct-a8-manifest",
+    type=Path,
+    help="Use the 64-aligned direct backend instead of the vendor A8 OPP",
+)
 parser.add_argument("--library", type=Path, required=True)
 parser.add_argument("--output", type=Path, required=True)
 parser.add_argument("--layers", type=int, nargs="+", default=[0, 31, 61])
@@ -48,6 +54,10 @@ torch.ops.load_library(str(args.library))
 manifest = json.loads(args.native_manifest.read_text())
 check_manifest(manifest)
 backend = NativeW4(manifest, [args.device])
+direct_manifest = (
+    json.loads(args.direct_a8_manifest.read_text()) if args.direct_a8_manifest else None
+)
+direct = DirectA8(direct_manifest, [args.device]) if direct_manifest else None
 records = []
 
 
@@ -132,7 +142,11 @@ def run(index):
                     )
                 hostparts.append((*cs, torch.full_like(cs[1], 8, dtype=torch.int8)))
             host = TiledBank(hostparts, input_width, sum(b - a for a, b in ranges))
-            native = NativeA8Bank(host, args.device)
+            native = (
+                DirectA8Bank(host, args.device, direct)
+                if direct is not None
+                else NativeA8Bank(host, args.device)
+            )
             old = TiledBank(
                 [tuple(v.to(args.device) for v in part) for part in hostparts],
                 host.inputs,
@@ -217,4 +231,7 @@ report = json.loads(args.output.read_text())
 report["completed"] = True
 report["layers"] = args.layers
 report["native_manifest_sha256"] = check_manifest(manifest)
+report["candidate"] = "direct-zero64" if direct is not None else "vendor-padded128"
+if direct_manifest is not None:
+    report["direct_a8_manifest_sha256"] = check_direct_manifest(direct_manifest)
 args.output.write_text(json.dumps(report, indent=2) + "\n")

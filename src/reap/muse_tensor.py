@@ -1,8 +1,9 @@
 """Output-sharded experts with host gathers and per-device decode graphs.
 
 Dense layers and KV stay on the sequential stages. Every expert projection uses
-all devices. Output partitioning preserves the original split-K reductions and
-FP16 rounding; it does not approximate routing, weights, or normalization.
+all devices. The default W4A16 path preserves the original split-K reductions
+and FP16 rounding without approximating routing, weights, or normalization.
+The explicitly selected experimental W4A8 backend quantizes activations.
 """
 
 from concurrent.futures import ThreadPoolExecutor
@@ -215,7 +216,14 @@ class TensorExperts:
 
 
 def shard_layer(
-    cpu, devices, owner, pool, *, decode_graphs=True, tensor_attention=False
+    cpu,
+    devices,
+    owner,
+    pool,
+    *,
+    decode_graphs=True,
+    tensor_attention=False,
+    expert_backend=None,
 ):
     if (
         cpu.gate_up.outputs != 2 * cpu.down.inputs
@@ -232,9 +240,21 @@ def shard_layer(
     for device, (lo, hi), (down_lo, down_hi) in zip(devices, gate_ranges, down_ranges):
         middle = cpu.down.inputs
         gate_up = slice_bank(
-            cpu.gate_up, [(lo, hi), (middle + lo, middle + hi)], device
+            cpu.gate_up,
+            [(lo, hi), (middle + lo, middle + hi)],
+            "cpu" if expert_backend is not None else device,
         )
-        down = slice_bank(cpu.down, [(down_lo, down_hi)], device)
+        down = slice_bank(
+            cpu.down,
+            [(down_lo, down_hi)],
+            "cpu" if expert_backend is not None else device,
+        )
+        if expert_backend is not None:
+            from reap.muse_int4 import DirectA8Bank
+
+            # Repack host slices before transfer: never retain both device layouts.
+            gate_up = DirectA8Bank(gate_up, device, expert_backend)
+            down = DirectA8Bank(down, device, expert_backend)
         if str(device) == str(owner):
             weights = {
                 name: native_weight(value.clone(), device)
@@ -314,6 +334,7 @@ def tensor_plan(
     prefix_cache=False,
     tensor_attention=False,
     tensor_output=False,
+    experimental_a8=False,
 ):
     """Account for every shard, dense NZ matrix, KV slot, and global tensor."""
     from reap.muse_runtime import PREFIX
@@ -364,11 +385,18 @@ def tensor_plan(
                 )
                 cost = record["bytes"]
                 if name.endswith(".weight_scale"):
-                    cost += cost // 2  # UINT4's signed-zero offsets are INT8.
+                    # Direct A8 retains FP16 scale + weight sum; W4A16 uses
+                    # FP16 scale + INT8 signed-zero offset.
+                    cost += cost if experimental_a8 else cost // 2
                 for r, (lo, hi) in enumerate(
                     partitions(size, ranks, index, alignment=32)
                 ):
-                    experts[r] += cost * (hi - lo) // size
+                    width = hi - lo
+                    if experimental_a8:
+                        # Gate/up are combined before padding, down is standalone.
+                        multiple = 64 if ".down_proj." in name else 32
+                        width = (width + multiple - 1) // multiple * multiple
+                    experts[r] += cost * width // size
     for filename, shard in journal["shards"].items():
         if filename.startswith("global-"):
             for name, record in shard["tensors"].items():

@@ -38,6 +38,10 @@ def target(name):
 
 class Resident:
     def __init__(self, runtime):
+        if getattr(runtime, "experimental_a8_manifest", None) is not None:
+            raise ValueError(
+                "experimental A8 is offline-only; resident controls require W4A16"
+            )
         if not runtime.optimized:
             raise ValueError("resident controls require optimized runtime")
         self.runtime = runtime

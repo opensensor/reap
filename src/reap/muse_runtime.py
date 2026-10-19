@@ -318,8 +318,11 @@ def placement_plan(
     tensor_attention=False,
     tensor_output=False,
     prefix_cache=False,
+    experimental_a8=False,
 ):
     """Minimax contiguous layer placement, including globals and bounded KV."""
+    if experimental_a8 and not (optimized and tensor_experts):
+        raise ValueError("experimental A8 requires optimized tensor experts")
     if tensor_output and not tensor_experts:
         raise ValueError("tensor output requires tensor experts")
     if tensor_attention and not tensor_experts:
@@ -447,6 +450,7 @@ def placement_plan(
             prefix_cache=prefix_cache,
             tensor_attention=tensor_attention,
             tensor_output=tensor_output,
+            experimental_a8=experimental_a8,
         )
     return stages
 
@@ -469,8 +473,15 @@ class MuseRuntime:
         tensor_attention=False,
         tensor_output=False,
         prefix_cache=False,
+        experimental_a8_manifest=None,
     ):
         self.root = Path(root)
+        # Explicit offline experiment only; Resident's exact-W4 controls reject it.
+        self.experimental_a8_manifest = experimental_a8_manifest
+        if experimental_a8_manifest is not None:
+            from reap.muse_int4 import check_direct_manifest
+
+            check_direct_manifest(experimental_a8_manifest)
         self.progress = progress
         self.generation_stats = {}
         self.journal = json.loads((self.root / "export-progress.json").read_text())
@@ -527,6 +538,7 @@ class MuseRuntime:
             prefix_cache=prefix_cache,
             tensor_attention=tensor_attention,
             tensor_output=tensor_output,
+            experimental_a8=experimental_a8_manifest is not None,
         )
         loader = load_layer
         if optimized:
@@ -534,8 +546,12 @@ class MuseRuntime:
 
             loader = load_fast_layer
             for name in (
-                "npu_qwen_w4_group_matmul_310",
-                "npu_qwen_w4_routed_matmul_310",
+                ()
+                if experimental_a8_manifest is not None
+                else (
+                    "npu_qwen_w4_group_matmul_310",
+                    "npu_qwen_w4_routed_matmul_310",
+                )
             ):
                 if not hasattr(torch.ops._C_ascend, name):
                     raise RuntimeError(
@@ -552,6 +568,12 @@ class MuseRuntime:
                     )
         self.layers, self.globals = [], {}
         self.resident_layers = []
+        expert_backend = None
+        if experimental_a8_manifest is not None:
+            from reap.muse_int4 import DirectA8
+
+            expert_backend = DirectA8(experimental_a8_manifest, devices)
+            self.execution += "; experimental W4A8 experts"
         if tensor_experts:
             from reap.muse_tensor import make_pool
 
@@ -580,6 +602,7 @@ class MuseRuntime:
                         item["device"],
                         self.expert_pool,
                         tensor_attention=tensor_attention,
+                        expert_backend=expert_backend,
                     )
                     del cpu
                     self.resident_layers.extend(layer.tensor_experts.ranks)

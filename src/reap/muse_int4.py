@@ -1,9 +1,16 @@
-"""Experimental Qwen native W4A8 adapter; never selected by the serving runtime.
+"""Experimental Qwen native W4A8 adapter; serving defaults remain W4A16.
 
 Weights retain their W4 values. Activations are quantized per row and G128 by
 the Qwen operators, so this is not an exact-output replacement for W4A16.
 The physical INT4 layout follows vllm-ascend's Apache-2.0 w4a8_int4.py.
 """
+
+from collections import OrderedDict
+import hashlib
+import json
+from pathlib import Path
+import re
+from threading import RLock
 
 import torch
 import torch.nn.functional as F
@@ -120,4 +127,170 @@ class NativeA8Bank:
             )[:, : self.outputs].float()
             accumulator = value if accumulator is None else accumulator + value
             first += width
+        return accumulator.to(x.dtype)
+
+
+def check_direct_manifest(value):
+    if (
+        set(value) != {"name", "namespace", "abi", "library", "kernel", "quantizer"}
+        or value["abi"] != "muse-w4a8-zero64-v1"
+        or not re.fullmatch(r"muse_a8_[a-zA-Z0-9_]+", value["namespace"])
+        or not re.fullmatch(r"[a-zA-Z0-9_]+", value["name"])
+    ):
+        raise ValueError("invalid direct A8 manifest")
+    for name in ("library", "kernel", "quantizer"):
+        entry = value[name]
+        if set(entry) != {"path", "sha256"} or not Path(entry["path"]).is_absolute():
+            raise ValueError("invalid direct A8 artifact")
+        with Path(entry["path"]).open("rb") as f:
+            if hashlib.file_digest(f, "sha256").hexdigest() != entry["sha256"]:
+                raise ValueError(f"direct A8 {name} hash mismatch")
+    return hashlib.sha256(json.dumps(value, sort_keys=True).encode()).hexdigest()
+
+
+class DirectA8Bank:
+    """64-aligned native weights without resident zero-offset tensors."""
+
+    def __init__(self, bank, device, backend):
+        if not bank.parts or bank.inputs != sum(p[0].shape[-1] * 2 for p in bank.parts):
+            raise ValueError("invalid direct A8 split geometry")
+        experts = bank.parts[0][0].shape[0]
+        if not 1 <= experts <= 128 or any(
+            p[0].shape[:2] != (experts, bank.outputs) for p in bank.parts
+        ):
+            raise ValueError("invalid direct A8 expert geometry")
+        self.inputs, self.outputs, self.backend = bank.inputs, bank.outputs, backend
+        self.parts = []
+        for part in bank.parts:
+            q, scale, _, weight_sum = pack_part(*part, alignment=64)
+            self.parts.append(tuple(v.to(device) for v in (q, scale, weight_sum)))
+
+    def linear(self, x, *, ids=None, ends=None):
+        return self.backend.linear(self, x, ids=ids, ends=ends)
+
+
+class DirectA8:
+    """Versioned direct launch; graph owners must retain warmup geometry tensors."""
+
+    def __init__(self, manifest, devices):
+        check_direct_manifest(manifest)
+        self.manifest = manifest
+        self.geometry, self.kernels, self.empty = OrderedDict(), {}, {}
+        self.geometry_lock = RLock()
+        torch.ops.load_library(manifest["library"]["path"])
+        namespace = manifest["namespace"]
+        self.launch = getattr(getattr(torch.ops, namespace), "launch")
+        cls = getattr(getattr(torch.classes, namespace), "Kernel")
+        for device in devices:
+            device = torch.device(device)
+            with torch.npu.device(device):
+                self.kernels[device] = (
+                    cls(manifest["kernel"]["path"], "muse_a8_native"),
+                    cls(manifest["quantizer"]["path"], "qwen_w4_a8_pack_v310"),
+                )
+                self.empty[device] = torch.empty(0, dtype=torch.uint8, device=device)
+
+    def metadata(self, key, values):
+        # Six rank threads share this backend; tensor creation releases the GIL.
+        with self.geometry_lock:
+            if key not in self.geometry:
+                self.geometry[key] = torch.tensor(
+                    values, dtype=torch.int64, device=key[0]
+                )
+                if len(self.geometry) > 256:
+                    self.geometry.popitem(last=False)
+            self.geometry.move_to_end(key)
+            return self.geometry[key]
+
+    def linear(self, bank, x, *, ids=None, ends=None):
+        if (ids is None) == (ends is None):
+            raise ValueError("provide routed IDs or grouped ends")
+        if not bank.parts or bank.inputs != sum(p[0].shape[-1] * 2 for p in bank.parts):
+            raise ValueError("invalid direct A8 split geometry")
+        routes = ids if ids is not None else ends
+        experts = bank.parts[0][0].shape[0]
+        if (
+            x.ndim != 2
+            or x.shape[1] != bank.inputs
+            or x.dtype != torch.float16
+            or x.device not in self.kernels
+            or not 1 <= len(x) <= 4096
+            or routes.ndim != 1
+            or routes.device != x.device
+            or routes.dtype != (torch.int32 if ids is not None else torch.int64)
+            or len(routes) != (len(x) if ids is not None else experts)
+            or (ids is not None and len(x) > 128)
+        ):
+            raise ValueError("invalid direct A8 input/route geometry")
+        routes = routes.contiguous()
+        kernel, quantizer = self.kernels[x.device]
+        accumulator, first = None, 0
+        for q, scale, weight_sum in bank.parts:
+            e, n, packed_k = q.shape
+            k = packed_k * 2
+            if (
+                e != experts
+                or not 1 <= e <= 128
+                or n != (bank.outputs + 63) // 64 * 64
+                or not 64 <= n <= 5120
+                or not 256 <= k <= 2048
+                or k % 128
+                or q.dtype != torch.int8
+                or scale.dtype != torch.float16
+                or weight_sum.dtype != torch.float16
+                or scale.shape != (e, n, k // 128)
+                or weight_sum.shape != scale.shape
+                or any(
+                    v.device != x.device or not v.is_contiguous()
+                    for v in (q, scale, weight_sum)
+                )
+            ):
+                raise ValueError("invalid direct A8 weight ABI")
+            current = x[:, first : first + k].contiguous()
+            low = torch.empty((len(x), packed_k), dtype=torch.int8, device=x.device)
+            high = torch.empty_like(low)
+            activation_scale = torch.empty(
+                (len(x), k // 128, 8), dtype=torch.float32, device=x.device
+            )
+            activation_sum = torch.empty_like(activation_scale)
+            pack_meta = self.metadata(
+                (x.device, len(x), 0, k, 0, -1), [len(x) * k // 128]
+            )
+            self.launch(
+                quantizer,
+                [
+                    current,
+                    low,
+                    high,
+                    activation_scale,
+                    activation_sum,
+                    self.empty[x.device],
+                    pack_meta,
+                ],
+                8,
+            )
+            result = torch.empty((len(x), n), dtype=x.dtype, device=x.device)
+            meta = self.metadata(
+                (x.device, len(x), bank.outputs, k, e, int(ends is not None)),
+                [len(x), e, n, k, 8, int(ids is not None), 1],
+            )
+            self.launch(
+                kernel,
+                [
+                    low,
+                    high,
+                    activation_scale,
+                    activation_sum,
+                    q,
+                    scale,
+                    weight_sum,
+                    routes,
+                    result,
+                    meta,
+                ],
+                8,
+            )
+            value = result[:, : bank.outputs].float()
+            accumulator = value if accumulator is None else accumulator + value
+            first += k
         return accumulator.to(x.dtype)

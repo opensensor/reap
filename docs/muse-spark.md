@@ -1831,3 +1831,52 @@ full-model allocation, long-prefill shapes, changing graph inputs/routes, and
 quality/throughput gates remain outstanding. The prototype build inputs, hashes,
 scripts and binaries are retained under `opt-v15/native-a8-narrow`; serving
 continues to use the qualified W4A16 offset-eight runtime.
+
+
+### Versioned direct Qwen INT4 integration (2026-10-19)
+
+`scripts/muse_native/build_int4.py` now builds a separate `muse_a8_*` bridge,
+INT4 projection kernel and activation quantizer from frozen external Qwen/CANN
+inputs. The builder checks the upstream transformation anchors and records
+source/artifact hashes, commands, ABI and Torch versions. `DirectA8` verifies
+all three artifact hashes before loading the library. `DirectA8Bank` converts
+CPU slices before device transfer, pads to 64 output channels, and retains only
+INT4 codes, FP16 scales and FP16 weight sums. Known-zero offsets stay local to
+the kernel. Split-K accumulation and output cropping remain ordered.
+
+The actual packaged adapter, built as `muse_a8_v2`, matched the vendor A8
+operator for all 12 combinations of 672/704/1344/1408 output channels and
+8/512/4096 rows. Grouped tests include empty, singleton and uneven expert
+groups. Twelve graph capture generations also passed 480 changing-input/route
+replays after forcibly evicting their geometry metadata from the backend LRU;
+graph owners retained the required tensors. The shared metadata cache uses a
+lock because six rank threads can create descriptors concurrently. These are
+A8-to-A8 equivalence checks, not parity with serving W4A16.
+
+Six-device concurrent execution additionally passed 360 changing graph replays
+and 360 eager calls across down/up projections. The initial test harness used
+Torch NPU's process-wide default capture stream and returned incorrect graph
+outputs; using one capture stream per device, as Muse already does, resolved
+the failure. Both the failed run and corrected run are retained. This is a
+harness stream-selection result, not evidence of a driver or kernel repair.
+
+The direct backend also reproduces the six complete-MLP numerical results above
+using the serving W4-only OPP, without requiring the vendor A8 operator bundle.
+All W4A16 controls remain exact. This confirms the narrower allocation and
+implicit offsets preserve the candidate's measured arithmetic.
+
+`MuseRuntime(..., experimental_a8_manifest=manifest)` enables this layout only
+through an explicit offline experiment. Serving CLI defaults are unchanged,
+and resident exact-W4 hot-swap controls reject the experimental runtime. The
+planner accounts for each padded shard and both metadata tensors; tests compare
+its byte totals with actual sharded-bank storage. On the real 62-layer model,
+its expert-bank totals match the independent capacity calculation exactly.
+Dense/KV placement remains `0/4/15/26/38/50/62`; required allocations including
+98,304-token KV, prefix snapshots and the 3 GiB reserve are 43.87–44.16 GiB per
+chip. Actual full-model allocation and transient memory remain unverified.
+
+All **176 Muse tests pass**. Versioned build inputs, binaries and stress scripts
+are retained in `runs/muse-opt-v16`; results are in `results/muse-opt-v16`.
+Full-model teacher-forced/coding quality and full-model prefill/decode throughput
+are the next gates. The live worker remains the qualified W4A16 offset-eight
+runtime; no A8 end-to-end performance gain is claimed.
