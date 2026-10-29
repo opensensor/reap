@@ -214,3 +214,66 @@ def update_pruning_state(
     )
 
     return pruning_batch
+
+
+@torch.no_grad()
+def update_pruning_state_from_routed(
+    layer_state: dict[str, Any],
+    *,
+    selected_experts: torch.Tensor,
+    routing_weights: torch.Tensor,
+    activation_norms: torch.Tensor,
+    activation_maxima: torch.Tensor,
+    num_experts: int,
+) -> None:
+    """Accumulate pruning statistics from token-by-top-k routed summaries.
+
+    Weights must be the actual mixture coefficients, including the model's
+    normalization/scaling. No softmax or renormalization is applied here. This
+    avoids allocating an experts-by-tokens-by-hidden activation tensor. Callers
+    exclude padding tokens before computing these summaries.
+    """
+    shape = selected_experts.shape
+    if selected_experts.ndim != 2 or not 0 < shape[1] <= num_experts:
+        raise ValueError("selected_experts must have shape [tokens, top_k <= num_experts]")
+    if selected_experts.dtype != torch.long:
+        raise ValueError("selected_experts must contain int64 expert IDs")
+    summaries = (routing_weights, activation_norms, activation_maxima)
+    if any(value.shape != shape for value in summaries):
+        raise ValueError("routed summaries must have the same [tokens, top_k] shape")
+    if any(not torch.isfinite(value).all() for value in summaries):
+        raise ValueError("routed summaries must be finite")
+    if (routing_weights < 0).any() or (activation_norms < 0).any():
+        raise ValueError("routing weights and activation norms must be non-negative")
+    if selected_experts.numel():
+        if selected_experts.min() < 0 or selected_experts.max() >= num_experts:
+            raise ValueError("expert ID out of range")
+        ordered = selected_experts.sort(dim=-1).values
+        if (ordered[:, 1:] == ordered[:, :-1]).any():
+            raise ValueError("each token must select distinct experts")
+    if layer_state["expert_frequency"].numel() != num_experts:
+        raise ValueError("state expert count does not match routed summaries")
+
+    device = layer_state["expert_frequency"].device
+    ids = selected_experts.detach().reshape(-1).to(device)
+    weights, norms, maxima = [v.detach().reshape(-1).to(device, torch.float64) for v in summaries]
+    counts = torch.bincount(ids, minlength=num_experts)
+    norm_sum = torch.zeros(num_experts, device=device, dtype=torch.float64)
+    weighted_sum = torch.zeros_like(norm_sum)
+    weight_sum = torch.zeros_like(norm_sum)
+    norm_sum.index_add_(0, ids, norms)
+    weighted_sum.index_add_(0, ids, norms * weights)
+    weight_sum.index_add_(0, ids, weights)
+    peak = torch.zeros(num_experts, device=device, dtype=torch.float32)
+    peak.scatter_reduce_(0, ids, maxima.float(), reduce="amax", include_self=True)
+
+    layer_state["total_tokens"] += shape[0]
+    layer_state["expert_frequency"] += counts
+    # Preserve REAP's existing pairwise denominator convention (not co-occurrence).
+    layer_state["pairwise_expert_frequency"] += counts[:, None] + counts[None, :]
+    layer_state["ean_sum"] += norm_sum
+    layer_state["weighted_ean_sum"] += weighted_sum
+    layer_state["weighted_expert_frequency_sum"] += weight_sum
+    layer_state["ean_mean"].update((norm_sum / counts.clamp_min(1)).float(), counts)
+    layer_state["reap"].update((weighted_sum / counts.clamp_min(1)).float(), counts)
+    torch.maximum(layer_state["max_activations"], peak, out=layer_state["max_activations"])

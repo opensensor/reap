@@ -1,0 +1,512 @@
+"""Capture decode normalization and residuals around dynamic attention and TP."""
+
+import torch
+import torch.nn.functional as F
+from reap.muse_fast import FastMuseLayer, TiledBank
+from reap.muse_tensor import DecodeGraph
+
+original_moe = getattr(FastMuseLayer.moe, "_muse_original", FastMuseLayer.moe)
+
+
+# Optional decode override: one CPU per rank, then the inference thread.
+# Append CPU_AFFINITY = (...) to a frozen copy; empty restores saved masks.
+CPU_AFFINITY = ()
+
+
+def bind_rank_threads(experts, cpus):
+    import os
+    import threading
+
+    pool = getattr(experts, "pool", None)
+    saved = getattr(pool, "_muse_affinity_original", {})
+    if not cpus and not saved:
+        return
+    if pool is None:
+        raise ValueError("CPU affinity requires a tensor rank pool")
+    threads = [next(iter(worker._threads)).native_id for worker in pool.workers]
+    threads.append(threading.get_native_id())
+    if cpus and (len(cpus) != len(threads) or len(set(cpus)) != len(cpus)):
+        raise ValueError("CPU affinity requires one distinct CPU per rank and caller")
+    # Validate every target before changing any mask. Keep the initial masks so
+    # disabling the override restores all inference threads used by either port.
+    current, desired = {}, {}
+    for tid in threads if cpus else saved:
+        try:
+            current[tid] = os.sched_getaffinity(tid)
+        except ProcessLookupError:
+            if cpus:
+                raise
+            continue
+        saved.setdefault(tid, current[tid])
+        desired[tid] = {cpus[threads.index(tid)]} if cpus else saved[tid]
+        if not desired[tid].issubset(saved[tid]):
+            raise ValueError("requested CPU outside original thread affinity")
+    changed = []
+    try:
+        for tid, mask in desired.items():
+            if current[tid] != mask:
+                os.sched_setaffinity(tid, mask)
+                changed.append(tid)
+    except BaseException:
+        for tid in reversed(changed):
+            os.sched_setaffinity(tid, current[tid])
+        raise
+    pool._muse_affinity_original = saved if cpus else {}
+
+
+def prepare(self, x, unused):
+    c = self.c
+    flat = x.reshape(-1, x.shape[-1])
+    scores = torch.sigmoid(
+        F.linear(flat.float(), self.w["mlp.gate.weight"].float()) * c.output_multiplier
+    )
+    ids = torch.topk(
+        scores + self.w["mlp.gate.e_score_correction_bias"],
+        c.num_experts_per_tok,
+        dim=-1,
+        sorted=False,
+    ).indices
+    coefficients = scores.gather(1, ids)
+    coefficients = (
+        coefficients
+        / (coefficients.sum(-1, keepdim=True) + 1e-15)
+        * c.routed_scaling_factor
+    )
+    ids, order = ids.sort(dim=-1)
+    coefficients = coefficients.gather(1, order)
+    latent = self.norm("mlp.pre_expert_norm", self.linear("mlp.pre_expert_proj", flat))
+    routes = (
+        latent[:, None, :]
+        .expand(-1, c.num_experts_per_tok, -1)
+        .reshape(-1, latent.shape[-1])
+    )
+    return routes, ids.flatten().to(torch.int32), coefficients
+
+
+def finish(self, projected, coefficients):
+    down = self.norm("mlp.experts.post_expert_norm", projected, input_scaled=True)
+    down = down.reshape(1, self.c.num_experts_per_tok, -1)
+    contributions = (down * coefficients[:, :, None]).to(projected.dtype)
+    total = torch.zeros(
+        (1, projected.shape[-1]), dtype=projected.dtype, device=projected.device
+    )
+    for slot in range(self.c.num_experts_per_tok):
+        total = total + contributions[:, slot]
+    return self.linear("mlp.post_expert_proj", total).view(1, 1, -1)
+
+
+def graph_moe(self, x):
+    if x.shape[1] > 1 and hasattr(self, "tensor_experts"):
+        return prefill_moe(self, x)
+    if x.shape[1] != 1 or not hasattr(self, "tensor_experts"):
+        return original_moe(self, x)
+    graphs = self.tensor_experts.graphs
+    if "owner-prepare" not in graphs:
+        dummy = torch.empty(0, dtype=torch.int32, device=x.device)
+        graphs["owner-prepare"] = DecodeGraph.capture(
+            lambda a, b: prepare(self, a, b), x, dummy
+        )
+    prep = graphs["owner-prepare"]
+    routes, ids, coefficients = prep.run(x, prep.routes)
+    projected = self.tensor_experts.project(routes, ids=ids)
+    if "owner-finish" not in graphs:
+        graphs["owner-finish"] = DecodeGraph.capture(
+            lambda a, b: finish(self, a, b), projected, coefficients
+        )
+    return graphs["owner-finish"].run(projected, coefficients)
+
+
+# Also works with the initially deployed tensor runtime, whose graph container
+# predates explicit retention of native warmup metadata outside the graph pool.
+original_linear = getattr(TiledBank.linear, "_muse_original", TiledBank.linear)
+original_attention_inputs = getattr(
+    FastMuseLayer.attention_inputs, "_muse_original", FastMuseLayer.attention_inputs
+)
+original_attention_output = getattr(
+    FastMuseLayer.attention_output, "_muse_original", FastMuseLayer.attention_output
+)
+
+
+def retained_linear(self, x, *, expert=None, ids=None, ends=None):
+    result = original_linear(self, x, expert=expert, ids=ids, ends=ends)
+    if self.backend is not None and ids is not None and len(x) == 8:
+        if not hasattr(self, "_decode_metadata"):
+            self._decode_metadata = {}
+        for key, meta in self.backend.geometry.items():
+            if (
+                key[0] == x.device
+                and key[1] == 8
+                and key[2] == self.outputs
+                and key[-1] == 0
+            ):
+                self._decode_metadata[meta.data_ptr()] = meta
+    return result
+
+
+def attention_qkv(self, x, phase, query=None):
+    c = self.c
+    q, k, v = [
+        (
+            query
+            if name == "q" and query is not None
+            else self.linear("self_attn." + name + "_proj", x)
+        )
+        .view(1, 1, -1, c.head_dim)
+        .transpose(1, 2)
+        for name in ("q", "k", "v")
+    ]
+    q = self.fast_rms(q, c.rms_norm_eps) * c.qk_scale_factor
+    k = self.fast_rms(k, c.rms_norm_eps)
+    if c.layer_rope_theta[self.index]:
+        cos, sin = phase[0], phase[1]
+
+        def rotate(t):
+            half = t.shape[-1] // 2
+            return t * cos + torch.cat((-t[..., half:], t[..., :half]), dim=-1) * sin
+
+        q, k = rotate(q), rotate(k)
+    return q, k, v
+
+
+def graph_attention_inputs(self, x, start):
+    if x.shape[1] != 1 or not hasattr(self, "tensor_experts"):
+        return original_attention_inputs(self, x, start)
+    positions, cos, sin = self.positions.get(self.c, x, start, 1)
+    phase = torch.stack((cos, sin))
+    graphs = self.tensor_experts.graphs
+    if "attention-inputs" not in graphs:
+        graphs["attention-inputs"] = DecodeGraph.capture(
+            lambda a, b: attention_qkv(self, a, b), x, phase
+        )
+    q, k, v = graphs["attention-inputs"].run(x, phase)
+    return q, k, v, positions
+
+
+def graph_attention_output(self, attended, x):
+    if x.shape[1] != 1 or not hasattr(self, "tensor_experts"):
+        return original_attention_output(self, attended, x)
+    graphs = self.tensor_experts.graphs
+    if "attention-output" not in graphs:
+        graphs["attention-output"] = DecodeGraph.capture(
+            lambda a, b: original_attention_output(self, a, b), attended, x
+        )
+    return graphs["attention-output"].run(attended, x)
+
+
+# Reapplying this candidate must wrap the same original implementation, not
+# nest graph capture through the previous generation's wrapper.
+for function, original in (
+    (graph_moe, original_moe),
+    (retained_linear, original_linear),
+    (graph_attention_inputs, original_attention_inputs),
+    (graph_attention_output, original_attention_output),
+):
+    function._muse_original = original
+
+
+original_call = getattr(
+    FastMuseLayer.__call__, "_muse_original", FastMuseLayer.__call__
+)
+
+
+def fused_layer(self, x, start=0, cache=None):
+    if self.index == 0 and hasattr(self, "tensor_experts"):
+        bind_rank_threads(
+            self.tensor_experts,
+            CPU_AFFINITY if x.ndim == 3 and x.shape[1] == 1 else (),
+        )
+    if x.ndim != 3 or x.shape[0] != 1 or x.shape[1] != 1 or start < 0:
+        return original_call(self, x, start, cache)
+    if not hasattr(self, "tensor_experts") or not getattr(
+        self, "bounded_attention", False
+    ):
+        return original_call(self, x, start, cache)
+    from reap.muse_attention import bounded_attention
+
+    graphs = self.tensor_experts.graphs
+    if self.c.layer_rope_theta[self.index]:
+        _, cos, sin = self.positions.get(self.c, x, start, 1)
+        previous = getattr(self.positions, "_decode_phase", None)
+        if previous is None or previous[0] is not cos or previous[1] is not sin:
+            previous = cos, sin, torch.stack((cos, sin))
+            self.positions._decode_phase = previous
+        phase = previous[2]
+    else:
+        phase = (
+            graphs["layer-inputs"].routes
+            if "layer-inputs" in graphs
+            else x.new_empty(0)
+        )
+
+    attention_gate = None
+    if hasattr(self, "tensor_attention"):
+        if "layer-normalized" not in graphs:
+            graphs["layer-normalized"] = DecodeGraph.capture(
+                lambda value, _: self.norm("input_layernorm", value), x, phase
+            )
+        norm_graph = graphs["layer-normalized"]
+        normalized = norm_graph.run(x, norm_graph.routes)
+        qg = self.tensor_attention.project(normalized)
+
+        def inputs(value, phase):
+            query, gate = value.chunk(2, dim=-1)
+            return *attention_qkv(self, normalized, phase, query), torch.sigmoid(gate)
+
+        if "layer-inputs" not in graphs:
+            graphs["layer-inputs"] = DecodeGraph.capture(inputs, qg, phase)
+        q, k, v, attention_gate = graphs["layer-inputs"].run(qg, phase)
+    else:
+
+        def inputs(value, phase):
+            normalized = self.norm("input_layernorm", value)
+            return normalized, *attention_qkv(self, normalized, phase)
+
+        if "layer-inputs" not in graphs:
+            graphs["layer-inputs"] = DecodeGraph.capture(inputs, x, phase)
+        normalized, q, k, v = graphs["layer-inputs"].run(x, phase)
+    attended = bounded_attention(
+        q,
+        k,
+        v,
+        start=start,
+        cache=cache,
+        window=self.c.sliding_window
+        if self.c.layer_types[self.index] == "sliding_attention"
+        else None,
+        max_context=self.max_context,
+        prefill_chunk=self.prefill_chunk,
+    )
+
+    def middle(attended, residual):
+        if attention_gate is None:
+            h = original_attention_output(self, attended, normalized)
+        else:
+            attended = attended.transpose(1, 2).contiguous()
+            attended = self.fast_rms(attended, self.c.rms_norm_eps).reshape(1, 1, -1)
+            h = self.linear("self_attn.o_proj", attended * attention_gate)
+        alpha, beta = self.residual_coefficients["post_attention"]
+        residual = (
+            alpha * residual + beta * self.fast_rms(h, self.c.post_norm_eps)
+        ).to(residual.dtype)
+        routed, ids, coefficients = prepare(
+            self, self.norm("pre_feedforward_layernorm", residual), None
+        )
+        return residual, routed, ids, coefficients
+
+    if "layer-middle" not in graphs:
+        graphs["layer-middle"] = DecodeGraph.capture(middle, attended, x)
+    residual, routed, ids, coefficients = graphs["layer-middle"].run(attended, x)
+    projected = pipelined_project(self.tensor_experts, routed, ids)
+
+    def output(projected, coefficients):
+        h = finish(self, projected, coefficients)
+        alpha, beta = self.residual_coefficients["post_feedforward"]
+        return (
+            alpha * residual
+            + beta * self.norm("post_feedforward_layernorm", h, input_scaled=True)
+        ).to(residual.dtype)
+
+    if "layer-output" not in graphs:
+        graphs["layer-output"] = DecodeGraph.capture(output, projected, coefficients)
+    return graphs["layer-output"].run(projected, coefficients)
+
+
+fused_layer._muse_original = original_call
+
+
+def replacements():
+    return {
+        "reap.muse_fast:FastMuseLayer.__call__": fused_layer,
+        "reap.muse_fast:FastMuseLayer.moe": graph_moe,
+        "reap.muse_fast:TiledBank.linear": retained_linear,
+        "reap.muse_fast:FastMuseLayer.attention_inputs": graph_attention_inputs,
+        "reap.muse_fast:FastMuseLayer.attention_output": graph_attention_output,
+    }
+
+
+_decode_staging = {}
+
+
+def pinned_snapshot(pool, phase, tensors):
+    # Decode copies are blocking. All futures are drained before another
+    # layer/request can overwrite these buffers on the same rank pool.
+    key = pool, phase
+    buffers = _decode_staging.get(key)
+    if buffers is None or any(
+        a.shape != b.shape or a.dtype != b.dtype for a, b in zip(buffers, tensors)
+    ):
+        buffers = tuple(
+            torch.empty(t.shape, dtype=t.dtype, device="cpu", pin_memory=True)
+            for t in tensors
+        )
+        _decode_staging[key] = buffers
+    for buffer, value in zip(buffers, tensors):
+        buffer.copy_(value)
+    return buffers
+
+
+def pipelined_project(experts, inputs, ids):
+    from threading import Barrier, BrokenBarrierError
+
+    host_inputs, host_routes = pinned_snapshot(experts.pool, "up", (inputs, ids))
+    experts.prepare_graphs(host_inputs, host_routes)
+    outputs = [None] * len(experts.ranks)
+    gathered = [None]
+
+    def combine():
+        (gathered[0],) = pinned_snapshot(
+            experts.pool, "down", (torch.cat(outputs, dim=-1),)
+        )
+
+    barrier = Barrier(len(experts.ranks), action=combine, timeout=60)
+
+    def host_result(i, phase, value):
+        # Rotating uneven shards have two widths. Keep both allocations so
+        # adjacent layers do not repeatedly allocate pinned host storage.
+        key = "result", i, phase, tuple(value.shape)
+        (result,) = pinned_snapshot(experts.pool, key, (value,))
+        return result
+
+    def run(i):
+        try:
+            with torch.inference_mode():
+                up = experts.graphs[i, "up"]
+                outputs[i] = host_result(i, "up", up.run(host_inputs, host_routes))
+                barrier.wait()
+                return host_result(
+                    i, "down", experts.graphs[i, "down"].run(gathered[0], up.routes)
+                )
+        except BaseException:
+            barrier.abort()
+            torch.npu.synchronize(experts.ranks[i].device)
+            raise
+
+    futures = [experts.pool.submit(run, i) for i in range(len(experts.ranks))]
+    results, failures = [], []
+    for future in futures:
+        try:
+            results.append(future.result())
+        except BaseException as exc:
+            failures.append(exc)
+    if failures:
+        raise next(
+            (exc for exc in failures if not isinstance(exc, BrokenBarrierError)),
+            failures[0],
+        )
+    return torch.cat(results, dim=-1).to(inputs.device)
+
+
+class PrefillLayer:
+    """Keep the original MoE math while substituting its transport method."""
+
+    def __init__(self, layer):
+        self.layer = layer
+
+    def __getattr__(self, name):
+        return getattr(self.layer, name)
+
+    def expert_projection(self, routes, **metadata):
+        return prefill_project(self.layer.tensor_experts, routes, **metadata)
+
+
+def prefill_moe(self, x):
+    return original_moe(PrefillLayer(self), x)
+
+
+_prefill_staging = {}
+_prefill_gathers = {}
+
+
+def prefill_project(self, inputs, *, ids=None, ends=None):
+    if (ids is None) == (ends is None):
+        raise ValueError("provide routed IDs or grouped ends")
+    device = inputs.device
+    # Copy directly to reusable pinned staging below. A pageable .cpu()
+    # temporary otherwise incurs allocation/fill plus another full host copy.
+    host_inputs = inputs
+    host_routes = ids if ids is not None else ends
+    use_graph = self.decode_graphs and ids is not None and len(inputs) == 8
+
+    def run(i, phase, value):
+        rank = self.ranks[i]
+        with torch.inference_mode(), torch.npu.device(rank.device):
+            routes = host_routes
+            try:
+                if use_graph:
+                    result = self.graphs[i, phase].run(value, routes)
+                else:
+                    result = self.operation(
+                        rank,
+                        phase,
+                        value.to(rank.device, non_blocking=True),
+                        routes.to(rank.device, non_blocking=True),
+                        ends is not None,
+                    )
+                # Rank-local buffers survive until every future has drained
+                # and the gather has finished. Keep one row count per shard
+                # width, so arbitrary prefill lengths cannot grow the cache.
+                key = ("prefill-result", i, phase, result.shape[-1])
+                return pinned_snapshot(self.pool, key, (result,))[0]
+            except BaseException:
+                # Pinned source buffers must not be reused while DMA reads
+                # remain outstanding, including after an operator failure.
+                torch.npu.synchronize(rank.device)
+                raise
+
+    for phase in ("up", "down"):
+        # One pinned snapshot serves all ranks. Sharing pageable buffers can
+        # exhaust the host driver's partial-pin retries on concurrent uploads.
+        # Layers on a rank pool run serially; separate pools need separate
+        # buffers. Every rank finishes its blocking CPU result copy (or error
+        # synchronization) before these snapshots can be overwritten.
+        buffers = _prefill_staging.get((self.pool, phase))
+        if (
+            buffers is None
+            or buffers[0].shape != host_inputs.shape
+            or buffers[1].shape != host_routes.shape
+            or buffers[0].dtype != host_inputs.dtype
+            or buffers[1].dtype != host_routes.dtype
+        ):
+            buffers = tuple(
+                torch.empty(t.shape, dtype=t.dtype, device="cpu", pin_memory=True)
+                for t in (host_inputs, host_routes)
+            )
+            _prefill_staging[self.pool, phase] = buffers
+        if host_inputs.device.type != "cpu" or not host_inputs.is_pinned():
+            buffers[0].copy_(host_inputs)
+            host_inputs = buffers[0]
+        buffers[1].copy_(host_routes)
+        host_routes = buffers[1]
+        if use_graph and phase == "up":
+            self.prepare_graphs(host_inputs, host_routes)
+        futures = [
+            self.pool.submit(run, i, phase, host_inputs) for i in range(len(self.ranks))
+        ]
+        # Wait for every rank even on error before allowing reset/hot swap.
+        results, failures = [], []
+        for future in futures:
+            try:
+                results.append(future.result())
+            except BaseException as exc:
+                failures.append(exc)
+        if failures:
+            raise failures[0]
+        # Every rank has finished its blocking result copy. Separate up/down
+        # gather buffers stay alive through the next phase and final upload.
+        # out= also avoids repeatedly initializing a large temporary under
+        # deterministic execution. Never alter the global deterministic policy.
+        shape = (results[0].shape[0], sum(value.shape[-1] for value in results))
+        key = self.pool, phase
+        gathered = _prefill_gathers.get(key)
+        if (
+            gathered is None
+            or gathered.shape != shape
+            or gathered.dtype != results[0].dtype
+        ):
+            gathered = torch.empty(
+                shape, dtype=results[0].dtype, device="cpu", pin_memory=True
+            )
+            _prefill_gathers[key] = gathered
+        torch.cat(results, dim=-1, out=gathered)
+        host_inputs = gathered
+    return host_inputs.to(device)

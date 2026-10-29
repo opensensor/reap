@@ -1,0 +1,257 @@
+"""Wait for a verified export and free NPUs, then launch and smoke-test Muse.
+
+Never stops another service. Run under the same CANN/custom-operator environment
+as muse_serve. Status and logs persist across client disconnects.
+"""
+
+import argparse
+import fcntl
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+
+from reap.muse_streaming import _save_json
+
+
+def http_json(url, body=None, timeout=10):
+    request = urllib.request.Request(
+        url,
+        data=None if body is None else json.dumps(body).encode(),
+        headers={"Content-Type": "application/json"},
+    )
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        return json.load(response)
+
+
+def run(args):
+    args.state_dir.mkdir(parents=True, exist_ok=True)
+    with (args.state_dir / "deploy.lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        state = {
+            "supervisor_pid": os.getpid(),
+            "model": str(args.model),
+            "started_unix": time.time(),
+            "serving_ready": False,
+        }
+        child = None
+
+        def report(phase, **values):
+            state.update(phase=phase, updated_unix=time.time(), **values)
+            _save_json(args.state_dir / "status.json", state)
+            print(json.dumps(state), flush=True)
+
+        try:
+            report("waiting_for_verified_model")
+            while not (args.model / "transfer-verified.json").exists():
+                time.sleep(30)
+            receipt = json.loads((args.model / "transfer-verified.json").read_text())
+            if not receipt.get("complete"):
+                raise ValueError("transfer verification is incomplete")
+            import torch
+            import torch_npu
+            from reap.muse_runtime import placement_plan
+
+            torch_npu.npu.set_compile_mode(jit_compile=False)
+            plan = placement_plan(
+                args.model,
+                args.devices,
+                args.max_context,
+                optimized=args.optimized,
+                bounded_attention=args.bounded_attention,
+                prefill_chunk=args.prefill_chunk,
+                tensor_experts=getattr(args, "tensor_experts", False),
+                tensor_attention=getattr(args, "tensor_attention", False),
+                tensor_output=getattr(args, "tensor_output", False),
+                prefix_cache=getattr(args, "prefix_cache", False),
+                experimental_a8=getattr(args, "experimental_a8_manifest", None)
+                is not None,
+            )
+            while True:
+                memory = []
+                for stage in plan:
+                    with torch.npu.device(stage["device"]):
+                        free, total = torch.npu.mem_get_info()
+                    memory.append({**stage, "free_bytes": free, "total_bytes": total})
+                if all(item["free_bytes"] >= item["required_bytes"] for item in memory):
+                    break
+                report("waiting_for_free_npus", memory=memory)
+                time.sleep(30)
+            command = [
+                sys.executable,
+                "-u",
+                "-m",
+                "reap.muse_serve",
+                "--model",
+                str(args.model),
+                "--devices",
+                *args.devices,
+                "--library",
+                str(args.library),
+                "--max-context",
+                str(args.max_context),
+                "--prefill-chunk",
+                str(args.prefill_chunk),
+                "--host",
+                "127.0.0.1",
+                "--port",
+                str(args.port),
+            ]
+            if getattr(args, "deterministic", False):
+                command.append("--deterministic")
+            if getattr(args, "tensor_experts", False):
+                command.append("--tensor-experts")
+            if getattr(args, "tensor_output", False):
+                command.append("--tensor-output")
+            if getattr(args, "tensor_attention", False):
+                command.append("--tensor-attention")
+            if args.optimized:
+                command.append("--optimized")
+            if args.bounded_attention:
+                command.append("--bounded-attention")
+            if getattr(args, "prefix_cache", False):
+                command.append("--prefix-cache")
+            if getattr(args, "experimental_lookup_tokens", 0):
+                command.extend(
+                    ["--experimental-lookup-tokens", str(args.experimental_lookup_tokens)]
+                )
+            for option in (
+                "packed_cache",
+                "resident_token_file",
+                "native_manifest",
+                "resident_patch_file",
+                "experimental_a8_manifest",
+                "experimental_a8_cache",
+            ):
+                if getattr(args, option, None):
+                    command.extend(
+                        ["--" + option.replace("_", "-"), str(getattr(args, option))]
+                    )
+            for port in getattr(args, "additional_port", []):
+                command.extend(["--additional-port", str(port)])
+            with (args.state_dir / "server.log").open("a") as log:
+                child = subprocess.Popen(
+                    command,
+                    stdin=subprocess.DEVNULL,
+                    stdout=log,
+                    stderr=subprocess.STDOUT,
+                )
+                report(
+                    "loading_model",
+                    server_pid=child.pid,
+                    command=command,
+                    memory=memory,
+                )
+                base = f"http://127.0.0.1:{args.port}"
+                deadline = time.monotonic() + 1800
+                while True:
+                    if child.poll() is not None:
+                        raise RuntimeError(
+                            f"server exited {child.returncode}; inspect server.log"
+                        )
+                    try:
+                        health = http_json(base + "/health")
+                        if (
+                            health.get("model") != args.model.name
+                            or health.get("pid") != child.pid
+                        ):
+                            raise RuntimeError("port belongs to a different server")
+                        break
+                    except urllib.error.URLError:
+                        if time.monotonic() > deadline:
+                            raise TimeoutError("model loading exceeded 30 minutes")
+                        time.sleep(10)
+                report("checking_first_response", health=health)
+                prompt = "def add(a, b):\n    "
+                started = time.monotonic()
+                response = http_json(
+                    base + "/v1/completions",
+                    {
+                        "model": args.model.name,
+                        "prompt": prompt,
+                        "max_tokens": 16,
+                        "temperature": 0,
+                    },
+                    timeout=900,
+                )
+                if (
+                    not response.get("choices")
+                    or not response["choices"][0].get("text", "").strip()
+                ):
+                    raise RuntimeError("first generation returned no text")
+                _save_json(
+                    args.state_dir / "first-response.json",
+                    {
+                        "prompt": prompt,
+                        "response": response,
+                        "seconds": time.monotonic() - started,
+                        "scope": "generation/HTTP smoke; not coding quality certification",
+                    },
+                )
+                report(
+                    "serving",
+                    serving_ready=True,
+                    first_response=str(args.state_dir / "first-response.json"),
+                )
+                code = child.wait()
+                report("stopped", serving_ready=False, server_exit_code=code)
+        except BaseException as exc:
+            report("failed", serving_ready=False, error=str(exc))
+            if child is not None and child.poll() is None:
+                child.terminate()
+                try:
+                    child.wait(timeout=30)
+                except subprocess.TimeoutExpired:
+                    child.kill()
+                    child.wait()
+            raise
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--model", type=Path, required=True)
+    parser.add_argument("--state-dir", type=Path, required=True)
+    parser.add_argument("--library", type=Path, required=True)
+    parser.add_argument("--devices", nargs="+", default=[f"npu:{i}" for i in range(6)])
+    parser.add_argument("--max-context", type=int, default=8192)
+    parser.add_argument("--prefill-chunk", type=int, default=64)
+    parser.add_argument("--port", type=int, default=8002)
+    parser.add_argument("--additional-port", type=int, action="append", default=[])
+    parser.add_argument("--optimized", action="store_true")
+    parser.add_argument("--tensor-experts", action="store_true")
+    parser.add_argument("--tensor-attention", action="store_true")
+    parser.add_argument("--tensor-output", action="store_true")
+    parser.add_argument("--deterministic", action="store_true")
+    parser.add_argument("--experimental-lookup-tokens", type=int, choices=range(8), default=0)
+    parser.add_argument("--bounded-attention", action="store_true")
+    parser.add_argument("--prefix-cache", action="store_true")
+    parser.add_argument("--packed-cache", type=Path)
+    parser.add_argument("--resident-token-file", type=Path)
+    parser.add_argument("--native-manifest", type=Path)
+    parser.add_argument("--experimental-a8-manifest", type=Path)
+    parser.add_argument("--experimental-a8-cache", type=Path)
+    parser.add_argument("--resident-patch-file", type=Path)
+    args = parser.parse_args()
+    if args.experimental_lookup_tokens and not (args.optimized and args.bounded_attention):
+        parser.error("lookup requires --optimized and --bounded-attention")
+    if args.experimental_a8_cache and not args.experimental_a8_manifest:
+        parser.error("--experimental-a8-cache requires --experimental-a8-manifest")
+    if args.experimental_a8_manifest:
+        if not (args.optimized and args.tensor_experts) or args.native_manifest:
+            parser.error("A8 requires optimized tensor experts and no W4A16 manifest")
+        from reap.muse_int4 import check_direct_manifest
+
+        check_direct_manifest(json.loads(args.experimental_a8_manifest.read_text()))
+    if args.bounded_attention and (not args.optimized or args.max_context < 1):
+        parser.error("--bounded-attention requires --optimized and positive context")
+    if any(not device.startswith("npu:") for device in args.devices):
+        parser.error("deployment supervisor requires explicit NPU devices")
+    run(args)
+
+
+if __name__ == "__main__":
+    main()

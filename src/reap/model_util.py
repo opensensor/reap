@@ -118,9 +118,49 @@ MODEL_ATTRS = {
 }
 
 
+for _architecture, _layers, _config in (
+    ("MuseSparkForCausalLM", "model.layers", "config"),
+    (
+        "MuseSparkForConditionalGeneration",
+        "model.language_model.layers",
+        "config.text_config",
+    ),
+):
+    MODEL_ATTRS[_architecture] = {
+        "moe_block": "mlp",
+        "gate_proj": "gate_up_proj",
+        "up_proj": "gate_up_proj",
+        "down_proj": "down_proj",
+        "experts": "experts",
+        "fused": True,
+        "router": "gate",
+        "num_experts": "num_local_experts",
+        "num_experts_per_tok": "num_experts_per_tok",
+        "layers_path": _layers,
+        "config_path": _config,
+        "pruning_adapter": "muse_spark",
+    }
+
+
+def get_model_layers(model):
+    attrs = MODEL_ATTRS[model.__class__.__name__]
+    module = model
+    for part in attrs.get("layers_path", "model.layers").split("."):
+        module = getattr(module, part)
+    return module
+
+
+def get_model_text_config(model):
+    attrs = MODEL_ATTRS[model.__class__.__name__]
+    config = model
+    for part in attrs.get("config_path", "config").split("."):
+        config = getattr(config, part)
+    return config
+
+
 def get_moe(model, layer):
     moe_attr_name = MODEL_ATTRS.get(model.__class__.__name__)["moe_block"]
-    return getattr(model.model.layers[layer], moe_attr_name)
+    return getattr(get_model_layers(model)[layer], moe_attr_name)
 
 
 def assert_merge(model, merged_moe, cluster_label):

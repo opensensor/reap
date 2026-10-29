@@ -223,6 +223,7 @@ class MoETransformerObserverConfig(BaseTransformerObserverHookConfig):
     distance_measure: str = "angular"
     renormalize_router_weights: bool = False
     record_pruning_metrics_only: bool = False
+    pruning_adapter: Optional[str] = None
 
 
 class MoETransformerObserver(BaseTransformerObserver):
@@ -314,6 +315,21 @@ class MoETransformerObserver(BaseTransformerObserver):
         return layer_state
 
     def _hook_factory(self, module: nn.Module, layer_number: int) -> callable:
+        if self.hook_config.pruning_adapter == "muse_spark":
+            from reap.models.muse_spark import collect_muse_pruning_metrics
+
+            @torch.no_grad()
+            def _muse_hook(module, args, output):
+                if layer_number not in self.state:
+                    self.state[layer_number] = initialize_pruning_state(
+                        module.experts.num_experts
+                    )
+                collect_muse_pruning_metrics(
+                    module, args[0], self.state[layer_number], self._current_attention_mask
+                )
+
+            return _muse_hook
+
         distance_fn = get_distance_fn("cosine") # always use cosine for online dist. metrics
         num_experts = reduce(
             getattr, self.hook_config.num_experts_attr_name.split("."), module
@@ -524,7 +540,26 @@ class Glm44MoEObserverHookConfig(MoETransformerObserverConfig):
     fused_experts: bool = False
 
 
+@dataclass
+class MuseSparkObserverHookConfig(MoETransformerObserverConfig):
+    module_class_name_to_hook_regex: Optional[str] = "MuseSparkMoE"
+    num_experts_attr_name: str = "experts.num_experts"
+    top_k_attr_name: str = "gate.top_k"
+    fused_experts: bool = True
+    record_pruning_metrics_only: bool = True
+    pruning_adapter: Optional[str] = "muse_spark"
+
+    def __post_init__(self):
+        if not self.record_pruning_metrics_only:
+            raise ValueError(
+                "Muse Spark currently supports pruning metrics only; "
+                "set record_pruning_metrics_only=True"
+            )
+
+
 OBSERVER_CONFIG_REGISTRY = {
+    "MuseSparkForCausalLM": MuseSparkObserverHookConfig,
+    "MuseSparkForConditionalGeneration": MuseSparkObserverHookConfig,
     "Qwen3MoeForCausalLM": Qwen3MoEObserverHookConfig,
     "NonUniformQwen3MoeForCausalLM": Qwen3MoEObserverHookConfig,
     "Llama4ForCausalLM": Llama4MoEObserverHookConfig,
